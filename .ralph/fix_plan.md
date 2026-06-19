@@ -29,10 +29,10 @@ Implement top-down. One item per loop. Specs live in `.ralph/specs/`. Port DSP f
 - [x] Watchdog: poll/subscribe Sonos state; if idle/paused/recovered while switch ON → re-play (backoff, log gap)
 
 ## Phase 4 — MQTT control entities (HA discovery)
-- [ ] `internal/mqtt`: connect, publish discovery configs for switch / select / number (see `specs/mqtt-entities.md` + `examples/`)
-- [ ] Subscribe command topics; map: switch ON/OFF → play/stop; select → preset (re-play if on); number → volume_set
-- [ ] Publish state topics + `availability` (online/offline LWT); reconcile on reconnect
-- [ ] Unit-test discovery payload JSON shape
+- [x] `internal/mqtt`: connect, publish discovery configs for switch / select / number (see `specs/mqtt-entities.md` + `examples/`). **VERIFIED BY RUN:** added `github.com/eclipse/paho.mqtt.golang v1.5.1` via `go get` (go.mod/go.sum updated). `internal/control` is the authoritative `{on,preset,volume}` state (mutex-guarded), satisfies `ha.Controller` (IsOn/SuppressedUntil/Replay) so the watchdog reads it; deliberate stop sets a 15 s suppress window. `internal/mqtt` publishes 3 retained discovery configs (homeassistant/{switch|select|number}/hwn_sonos/.../config) device-grouped under "White Noise (Sonos)" identifiers [hwn_sonos], LWT availability `hwnsonos/status` online/offline retained. Transport abstracted behind a `Broker` interface (paho adapter + fake in tests). `cmd/hwnsonos/main.go` now wires config→ha.Client→control.State→mqtt.Connect→watchdog + the existing /healthz + /stream server; graceful shutdown publishes MQTT offline and media_stop if on. `go build/vet ./...` clean, `gofmt -l internal/mqtt internal/control cmd` empty, `go test -race ./...` ALL pass (21 new tests in mqtt+control). Coverage: discovery JSON shape (topics, device block identifiers/name/mfr/model, availability_topic, switch payload_on/off, select options order, number min/max/step/unit), command→action mapping via fake player+broker (ON→play, OFF→stop, preset re-play-when-on / no-replay-when-off / invalid-rejected, volume set+clamp+non-int-ignored), OnConnect publishes discovery+online+state, reconcile re-asserts authoritative play_media (pink/55) not stale retained, PublishOffline retained; control suppress-window-on-stop with injected clock.
+- [x] Subscribe command topics; map: switch ON/OFF → play/stop; select → preset (re-play if on); number → volume_set
+- [x] Publish state topics + `availability` (online/offline LWT); reconcile on reconnect
+- [x] Unit-test discovery payload JSON shape
 
 ## Phase 5 — Hardening & docs
 - [ ] Backoff/jitter on all reconnect loops; structured logging
