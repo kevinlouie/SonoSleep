@@ -1,0 +1,16 @@
+# Example deployment on the Synology HA host. host network so the Sonos can reach the
+# stream port and the service can reach the MQTT broker / HA on the LAN.
+services:
+  hwnsonos:
+    build: ..
+    container_name: hwnsonos
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../.env
+    # Health check hits the local stream service.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8099/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

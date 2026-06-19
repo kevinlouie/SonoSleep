@@ -1,0 +1,16 @@
+{
+  "name": "White Noise",
+  "unique_id": "hwn_sonos_power",
+  "command_topic": "hwnsonos/power/set",
+  "state_topic": "hwnsonos/power/state",
+  "payload_on": "ON",
+  "payload_off": "OFF",
+  "icon": "mdi:weather-fog",
+  "availability_topic": "hwnsonos/status",
+  "device": {
+    "identifiers": ["hwn_sonos"],
+    "name": "White Noise (Sonos)",
+    "manufacturer": "ha-white-noise-sonos",
+    "model": "Go noise service"
+  }
+}
