@@ -23,10 +23,10 @@ Implement top-down. One item per loop. Specs live in `.ralph/specs/`. Port DSP f
 - [x] **Sonos compat PRE-VERIFIED (2026-06-19, kitchen + SomaFM Icecast):** plain http URL → UPnP 714; `x-rincon-mp3radio://` scheme → plays; held ~8 min with no drop. Re-run on `media_player.bedroom` once built, but architecture is confirmed.
 
 ## Phase 3 — Home Assistant orchestration
-- [ ] `internal/ha`: REST client — `play_media`, `volume_set`, `media_stop`, `get_state`
-- [ ] Play: `play_media(media_content_id = <PUBLIC_BASE_URL>/stream?preset=<p>, media_content_type = music)` then `volume_set`
-- [ ] Handle target `unavailable` (speaker off): retry with backoff, surface state
-- [ ] Watchdog: poll/subscribe Sonos state; if idle/paused/recovered while switch ON → re-play (backoff, log gap)
+- [x] `internal/ha`: REST client — `play_media`, `volume_set`, `media_stop`, `get_state`. **VERIFIED BY RUN:** 19 tests pass (incl. under `-race`); `go build/vet` + `gofmt -l internal/ha` clean. Coverage: play_media request shape (POST `/api/services/media_player/play_media`, `Bearer` auth, `application/json`, body asserts the `x-rincon-mp3radio://http://host:8099/stream?preset=brown` content_id + `media_content_type:music`), volume_set (0–100→0.0–1.0 incl. clamp), media_stop body, get_state path/auth/decode, backoff-on-unavailable (probe→sleep→probe until available, then play issued) + ErrUnavailable after maxRetries, callService error-status wrapping, and watchdog decision logic (idle/paused→replay; off/suppressed/playing/still-unavailable→no replay; unavailable→recovery edge→replay; get_state error→no replay; Run cancels on ctx). Sleeps/jitter/clock injected so tests run in ~1s, no live network.
+- [x] Play: `play_media(media_content_id = <PUBLIC_BASE_URL>/stream?preset=<p>, media_content_type = music)` then `volume_set`
+- [x] Handle target `unavailable` (speaker off): retry with backoff, surface state
+- [x] Watchdog: poll/subscribe Sonos state; if idle/paused/recovered while switch ON → re-play (backoff, log gap)
 
 ## Phase 4 — MQTT control entities (HA discovery)
 - [ ] `internal/mqtt`: connect, publish discovery configs for switch / select / number (see `specs/mqtt-entities.md` + `examples/`)
