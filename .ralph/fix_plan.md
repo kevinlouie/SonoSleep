@@ -4,22 +4,22 @@ Implement top-down. One item per loop. Specs live in `.ralph/specs/`. Port DSP f
 `../reSpeakerSleep`. Do not start Phase N+1 until Phase N's core item works.
 
 ## Phase 0 — Scaffolding
-- [ ] Init Go module (`go mod init`), create `cmd/hwnsonos` + `internal/{noise,stream,ha,mqtt,config}` skeleton
-- [ ] `internal/config`: load env (see `AGENT.md`), `.env.example`, fail fast on missing required vars
-- [ ] Health endpoint `GET /healthz` returning 200
-- [ ] `Dockerfile` (Go build + ffmpeg) and `docker-compose.yml` (host network, env_file)
+- [x] Init Go module (`go mod init`), create `cmd/hwnsonos` + `internal/config` skeleton (other `internal/*` pkgs created as their phases land)
+- [x] `internal/config`: load env (see `AGENT.md`), fail fast on missing required vars (+ unit tests). `.env.example` already present
+- [x] Health endpoint `GET /healthz` returning 200 (in `cmd/hwnsonos/main.go`)
+- [x] `Dockerfile` (Go build + ffmpeg runtime) and root `docker-compose.yml` (host network, env_file)
 
 ## Phase 1 — Noise synthesis (port from reSpeakerSleep)
-- [ ] `internal/noise`: white generator (s16le, stereo, 48 kHz) — see `specs/brown-noise-dsp.md`
-- [ ] Brown = one-pole lowpass on white, fc ≈ 115 Hz, RMS ≈ 0.3 (no clipping/stutter)
-- [ ] Pink = Paul Kellet filter
-- [ ] Preset enum {white, pink, brown}; volume scale 0–100 → linear gain
-- [ ] Unit tests: RMS within tolerance, brown has more low-freq energy than white (FFT band ratio)
+- [x] `internal/noise`: white generator (s16le, stereo, 48 kHz) — see `specs/brown-noise-dsp.md`
+- [x] Brown = one-pole lowpass on white, fc ≈ 115 Hz, RMS ≈ 0.3 (no clipping/stutter)
+- [x] Pink = Paul Kellet filter
+- [x] Preset enum {white, pink, brown}; volume scale 0–100 → linear gain (`VolumeGain`, HA-side)
+- [x] Unit tests: RMS within tolerance, brown has more low-freq energy than white (FFT band ratio). **PASS (verified by run):** white RMS 0.250, brown 0.310, pink 0.201; low-band(<500Hz) fraction white 0.022 / pink 0.619 / brown 0.862. `go vet`+`gofmt` clean.
 
 ## Phase 2 — Infinite MP3 stream (LOAD-BEARING; de-risk early)
-- [ ] `internal/stream`: `GET /stream?preset=brown` → spawn `ffmpeg -f s16le -ar 48000 -ac 2 -i - -f mp3 -`, pipe generated PCM into stdin, copy stdout to response
-- [ ] Headers per `specs/sonos-streaming.md`: `Content-Type: audio/mpeg`, chunked, NO `Content-Length`, no caching; flush regularly
-- [ ] Clean teardown when client disconnects (kill ffmpeg, stop generator goroutine) — no leaks
+- [x] `internal/stream`: `GET /stream?preset=brown` → spawn `ffmpeg -f s16le -ar 48000 -ac 2 -i - -c:a libmp3lame -b:a 192k -f mp3 -`, pipe generated PCM into stdin, copy stdout to response. Wired into `main.go` (`mux.Handle("/stream", ...)`). **VERIFIED BY RUN:** real-ffmpeg test produces valid MP3 (frame sync 0xFF Ex).
+- [x] Headers per `specs/sonos-streaming.md`: `Content-Type: audio/mpeg`, chunked (no `Content-Length` → resp.ContentLength == -1), `Cache-Control: no-cache, no-store`, flush after every block + after headers. Bad preset → 400.
+- [x] Clean teardown when client disconnects (`exec.CommandContext` SIGKILLs ffmpeg → stdin pipe closes → feeder goroutine exits; deferred `cmd.Wait` reaps). **VERIFIED BY RUN under `-race`:** teardown test cancels mid-stream, asserts process reaped (onStreamEnd hook).
 - [x] **Sonos compat PRE-VERIFIED (2026-06-19, kitchen + SomaFM Icecast):** plain http URL → UPnP 714; `x-rincon-mp3radio://` scheme → plays; held ~8 min with no drop. Re-run on `media_player.bedroom` once built, but architecture is confirmed.
 
 ## Phase 3 — Home Assistant orchestration

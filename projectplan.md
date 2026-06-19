@@ -91,6 +91,42 @@ Synology docker host
   prefix with **`x-rincon-mp3radio://`** scheme → plays. Go HA client must emit
   `x-rincon-mp3radio://http://<host>:<port>/stream?preset=<p>`. See memory
   `sonos-714-mp3radio-scheme`. Duration-hold test (>5 min) in progress.
+- 2026-06-19: **Phase 0 scaffold landed.** `go.mod` (module
+  `github.com/kevin/ha-white-noise-sonos`, go 1.22), `internal/config` (env loader,
+  fail-fast on required vars, unit tests), `cmd/hwnsonos/main.go` (`/healthz` + graceful
+  shutdown), `Dockerfile` (golang build → debian-slim + ffmpeg), root `docker-compose.yml`
+  (host network). NOTE: `go build`/`go test` are blocked by the Ralph sandbox permission
+  policy this loop — code is unverified-by-run; human should run `go test ./...` once.
+  Other `internal/*` packages (noise, stream, ha, mqtt) will be created with their phases.
+  ACTION FOR HUMAN: `go`, `gofmt` AND writing `.claude/settings*.json` are all blocked by
+  the sandbox in autonomous loops — so Ralph cannot self-grant build/test access. Add
+  `Bash(go build:*)`, `Bash(go test:*)`, `Bash(go vet:*)`, `Bash(go run:*)`,
+  `Bash(go mod:*)`, `Bash(gofmt:*)` to `.claude/settings.local.json` `permissions.allow`
+  so future loops can compile + run tests. Until then every Go loop ships unverified-by-run.
+- 2026-06-19: **Phase 1 noise DSP landed + VERIFIED BY RUN.** `internal/noise` ports
+  reSpeakerSleep verbatim: xorshift32 white, one-pole-lowpass brown (a=0.015 → fc≈115 Hz,
+  ×6), Paul Kellet pink (×0.11). Fixed gains kept (preserve reference's by-ear relative
+  levels — did NOT calibrate, which would have made the RMS test vacuous). `Generator.Fill`
+  emits s16le stereo mono-duplicated; 0.95 headroom before int16. `go test` now WORKS this
+  loop (sandbox `Bash(go ...)` perms were added) — all pass: white RMS 0.250, brown 0.310,
+  pink 0.201; low-band(<500Hz) energy fraction white 0.022 / pink 0.619 / brown 0.862
+  (brown>pink>white as required). `go vet` + `gofmt` clean. Note: pink's exact RMS (0.201)
+  is whatever the reference *0.11 yields — sane band, not independently re-tuned. `VolumeGain`
+  (0–100→0.0–1.0 linear) is a units map for HA `volume_set`, applied Sonos-side, NOT in PCM.
+  Next: Phase 2 `internal/stream` (ffmpeg pipe → infinite chunked MP3).
+- 2026-06-19: **Phase 2 stream endpoint landed + VERIFIED BY RUN.** `internal/stream`:
+  `GET /stream?preset={white|pink|brown}` spawns `ffmpeg -f s16le -ar 48000 -ac 2 -i -
+  -c:a libmp3lame -b:a 192k -f mp3 -`, feeds it `noise.Generator` PCM in 4096-frame blocks
+  via a goroutine, copies MP3 stdout to the response flushing after each block. Headers:
+  `audio/mpeg`, no `Content-Length` (→ chunked), `Cache-Control: no-cache, no-store`.
+  Lifetime tied to `r.Context()`: client disconnect → `exec.CommandContext` SIGKILLs ffmpeg
+  → stdin pipe closes → feeder exits; deferred `cmd.Wait` reaps (no leaks). ffmpeg stderr →
+  service log for live-Sonos diagnostics. Encoder is injectable (`encoderCmd` field) so tests
+  use `cat` without ffmpeg; `onStreamEnd` hook makes teardown race-free to assert. Tests pass
+  under `-race`: 400 on bad preset, header/chunked checks, byte-flow, teardown-reaps-process,
+  and a real-ffmpeg test confirming valid MP3 output. `go build/vet`, `gofmt -l` clean.
+  NOTE: the `x-rincon-mp3radio://` scheme is NOT applied here — it belongs in the Phase-3 HA
+  client that calls `play_media`. This endpoint just serves plain MP3. Next: Phase 3 `internal/ha`.
 - 2026-06-19: **Duration test PASSED.** Kitchen held the Icecast MP3 stream ~8 min
   continuous, no drop/idle/pause; SomaFM track titles rotated normally. The ~300 s Sonos
   cutoff did NOT occur. Architecture validated: `x-rincon-mp3radio://` + infinite chunked
