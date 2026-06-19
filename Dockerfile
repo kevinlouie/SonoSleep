@@ -1,6 +1,6 @@
 # Build the static-ish Go binary, then ship it on a slim runtime that has ffmpeg
 # (the PCM->MP3 encoder the stream handler pipes through).
-FROM golang:1.22-bookworm AS build
+FROM golang:1.24-bookworm AS build
 WORKDIR /src
 # Cache module downloads. (No deps yet; go.sum may be absent.)
 COPY go.mod ./
