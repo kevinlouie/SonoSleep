@@ -24,20 +24,26 @@ libmp3lame -b:a 192k -f mp3 -` (CBR for stable streaming; tune bitrate later).
 Optionally prepend ICY headers (`icy-name`, `icy-br`) if drop tests show Sonos prefers
 radio-style streams.
 
-## play_media call (from the Go HA client)
+## play_media call (from the Go HA client) — VERIFIED 2026-06-19
+**A plain `http://` URL with `media_content_type: music` FAILS with UPnP 714 "Illegal
+MIME-Type"** on this Sonos — confirmed against the live kitchen speaker even with a
+known-good Icecast MP3 radio stream (SomaFM). The fix that works is the Sonos
+**`x-rincon-mp3radio://` URI scheme** prefix, which makes Sonos treat the URL as an MP3
+radio stream and skips the MIME check:
 ```jsonc
 // POST /api/services/media_player/play_media
 {
   "entity_id": "media_player.bedroom",
-  "media_content_id": "http://<HWN_PUBLIC_BASE_URL>/stream?preset=brown",
+  "media_content_id": "x-rincon-mp3radio://http://<host>:<port>/stream?preset=brown",
   "media_content_type": "music"
 }
 ```
-- `media_content_type: music` is the known-good value for direct URLs on Sonos.
-- If 714 persists, try a URL that ends in `.mp3` (e.g. `/stream/brown.mp3?...`) — some
-  Sonos firmware sniffs the extension. Keep both routes available.
+- Keep the inner `http://` after the scheme — verified working form is
+  `x-rincon-mp3radio://http://...` (Sonos reports it back exactly that way).
+- `media_content_type: music` is still the type to send.
 - The URL host MUST be LAN-reachable by the Sonos (the Synology host IP/hostname, not
   `localhost`). Set via `HWN_PUBLIC_BASE_URL`.
+- The Go HA client builds: `"x-rincon-mp3radio://" + HWN_PUBLIC_BASE_URL + "/stream?preset=" + preset`.
 
 ## Reconnect / watchdog
 Sonos may still drop very long streams. Strategy:

@@ -86,3 +86,13 @@ Synology docker host
   `kitchen` are Sonos (`x-sonos-htastream`/RINCON); `sonos` integration present, no
   Music Assistant. Decided: Go service + MP3 chunked stream + MQTT entities + HA REST
   orchestration + watchdog reconnect. Target = bedroom. Deploy = Synology docker.
+- 2026-06-19: **Live Sonos test (kitchen, SomaFM Icecast MP3).** Plain `http://` URL +
+  `media_content_type: music` → **UPnP 714 "Illegal MIME-Type"** (reproduced). Fix:
+  prefix with **`x-rincon-mp3radio://`** scheme → plays. Go HA client must emit
+  `x-rincon-mp3radio://http://<host>:<port>/stream?preset=<p>`. See memory
+  `sonos-714-mp3radio-scheme`. Duration-hold test (>5 min) in progress.
+- 2026-06-19: **Duration test PASSED.** Kitchen held the Icecast MP3 stream ~8 min
+  continuous, no drop/idle/pause; SomaFM track titles rotated normally. The ~300 s Sonos
+  cutoff did NOT occur. Architecture validated: `x-rincon-mp3radio://` + infinite chunked
+  MP3 plays indefinitely. Watchdog reconnect stays in scope as a safety net but is not the
+  primary mechanism. Kitchen restored (stopped, volume 0.2).

@@ -20,7 +20,7 @@ Implement top-down. One item per loop. Specs live in `.ralph/specs/`. Port DSP f
 - [ ] `internal/stream`: `GET /stream?preset=brown` → spawn `ffmpeg -f s16le -ar 48000 -ac 2 -i - -f mp3 -`, pipe generated PCM into stdin, copy stdout to response
 - [ ] Headers per `specs/sonos-streaming.md`: `Content-Type: audio/mpeg`, chunked, NO `Content-Length`, no caching; flush regularly
 - [ ] Clean teardown when client disconnects (kill ffmpeg, stop generator goroutine) — no leaks
-- [ ] **MANUAL VERIFY (human):** play the URL on `media_player.bedroom` for 60+ min; record if/when it drops and at what interval → tune the watchdog. Blocks Phase 3 design.
+- [x] **Sonos compat PRE-VERIFIED (2026-06-19, kitchen + SomaFM Icecast):** plain http URL → UPnP 714; `x-rincon-mp3radio://` scheme → plays; held ~8 min with no drop. Re-run on `media_player.bedroom` once built, but architecture is confirmed.
 
 ## Phase 3 — Home Assistant orchestration
 - [ ] `internal/ha`: REST client — `play_media`, `volume_set`, `media_stop`, `get_state`

@@ -19,9 +19,11 @@ curl -sf -X POST "${HWN_HA_BASE_URL}/api/services/media_player/play_media" \
   -H "Content-Type: application/json" \
   -d "{
         \"entity_id\": \"${ENTITY}\",
-        \"media_content_id\": \"${HWN_PUBLIC_BASE_URL}/stream?preset=${PRESET}\",
+        \"media_content_id\": \"x-rincon-mp3radio://${HWN_PUBLIC_BASE_URL}/stream?preset=${PRESET}\",
         \"media_content_type\": \"music\"
       }"
+# NOTE: the x-rincon-mp3radio:// scheme is REQUIRED — a plain http:// URL fails with
+# UPnP 714 "Illegal MIME-Type" on Sonos. Verified 2026-06-19. Keep the inner http://.
 
 # Set a gentle volume (0.0-1.0). Bedroom — keep it low.
 curl -sf -X POST "${HWN_HA_BASE_URL}/api/services/media_player/volume_set" \
