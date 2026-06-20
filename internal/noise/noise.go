@@ -10,6 +10,7 @@ package noise
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // PCM output format. Matches specs/brown-noise-dsp.md and what ffmpeg is told
@@ -76,6 +77,11 @@ const (
 	brownCoef = 0.015 // one-pole a → fc = a*fs/2π ≈ 115 Hz
 )
 
+// FadeInDuration is the default ramp length used by NewWithFade — matches the
+// ~3 s gain ramp reSpeakerSleep applied at start so playback eases in rather than
+// beginning at full level.
+const FadeInDuration = 3 * time.Second
+
 // Generator produces an endless stream of one preset. It is NOT safe for
 // concurrent use; create one per stream connection. To change preset mid-stream
 // the caller would tear down and recreate (the HTTP design uses preset per URL).
@@ -84,11 +90,41 @@ type Generator struct {
 	rng    uint32     // xorshift32 state
 	pinkB  [7]float64 // Paul Kellet filter state
 	brown  float64    // one-pole lowpass state
+
+	// Fade-in envelope. fadeFrames is the total ramp length in frames (0 disables
+	// the fade); fadePos counts frames emitted so far, capped at fadeFrames. Gain
+	// ramps linearly 0→1 over the first fadeFrames frames, then stays 1.
+	fadeFrames uint64
+	fadePos    uint64
 }
 
-// New returns a Generator for the given preset, seeded deterministically.
+// New returns a Generator for the given preset, seeded deterministically, with
+// no fade-in (gain starts at full level).
 func New(p Preset) *Generator {
 	return &Generator{preset: p, rng: 0x9E3779B9}
+}
+
+// NewWithFade is like New but applies a linear gain ramp from 0 to full over the
+// first `fade` of audio (clamped to >= 0). It eases playback in so the stream
+// does not begin abruptly at full level. A zero or negative fade disables the
+// ramp (equivalent to New).
+func NewWithFade(p Preset, fade time.Duration) *Generator {
+	g := New(p)
+	if fade > 0 {
+		g.fadeFrames = uint64(float64(fade) / float64(time.Second) * SampleRate)
+	}
+	return g
+}
+
+// fadeGain returns the envelope gain in [0,1] for the current fade position and
+// advances it by one frame. Without a configured fade it always returns 1.
+func (g *Generator) fadeGain() float64 {
+	if g.fadeFrames == 0 || g.fadePos >= g.fadeFrames {
+		return 1.0
+	}
+	gain := float64(g.fadePos) / float64(g.fadeFrames)
+	g.fadePos++
+	return gain
 }
 
 // white returns the next raw white sample, uniform in [-1, 1). xorshift32 RNG —
@@ -141,7 +177,9 @@ func (g *Generator) sample() float64 {
 func (g *Generator) Fill(buf []byte, frames int) int {
 	n := frames * BytesPerFrame
 	for i := 0; i < frames; i++ {
-		v := int16(g.sample() * fullScale)
+		// fadeGain advances the envelope one frame per output frame; it is 1.0
+		// once the ramp completes (and always 1.0 when no fade is configured).
+		v := int16(g.sample() * g.fadeGain() * fullScale)
 		lo := byte(v)
 		hi := byte(uint16(v) >> 8)
 		o := i * BytesPerFrame

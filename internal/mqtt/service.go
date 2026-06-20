@@ -2,7 +2,7 @@ package mqtt
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -60,7 +60,7 @@ func (s *Service) Subscribe(ctx context.Context) error {
 func (s *Service) onPower(ctx context.Context, payload []byte) {
 	on := strings.EqualFold(strings.TrimSpace(string(payload)), payloadOn)
 	if err := s.ctrl.SetOn(ctx, on); err != nil {
-		log.Printf("mqtt: power command (on=%v) failed: %v", on, err)
+		slog.Error("mqtt: power command failed", "on", on, "err", err)
 	}
 	s.PublishState()
 }
@@ -70,7 +70,7 @@ func (s *Service) onPower(ctx context.Context, payload []byte) {
 func (s *Service) onPreset(ctx context.Context, payload []byte) {
 	preset := strings.ToLower(strings.TrimSpace(string(payload)))
 	if err := s.ctrl.SetPreset(ctx, preset); err != nil {
-		log.Printf("mqtt: preset command (%q) rejected: %v", preset, err)
+		slog.Warn("mqtt: preset command rejected", "preset", preset, "err", err)
 		// State unchanged on rejection; re-publish so HA reverts to the truth.
 	}
 	s.PublishState()
@@ -80,12 +80,12 @@ func (s *Service) onPreset(ctx context.Context, payload []byte) {
 func (s *Service) onVolume(ctx context.Context, payload []byte) {
 	v, err := strconv.Atoi(strings.TrimSpace(string(payload)))
 	if err != nil {
-		log.Printf("mqtt: volume command %q is not an integer: %v", payload, err)
+		slog.Warn("mqtt: volume command is not an integer", "payload", string(payload), "err", err)
 		s.PublishState()
 		return
 	}
 	if err := s.ctrl.SetVolume(ctx, v); err != nil {
-		log.Printf("mqtt: volume command (%d) failed: %v", v, err)
+		slog.Error("mqtt: volume command failed", "volume", v, "err", err)
 	}
 	s.PublishState()
 }
@@ -138,7 +138,7 @@ func (s *Service) OnConnect(ctx context.Context) error {
 	if err := s.ctrl.Reassert(ctx); err != nil {
 		// Reassert failure (e.g. Sonos unavailable) is non-fatal: log and still
 		// publish state so HA reflects the intended control state.
-		log.Printf("mqtt: reconcile reassert failed: %v", err)
+		slog.Warn("mqtt: reconcile reassert failed", "err", err)
 	}
 	s.PublishState()
 	return nil
@@ -146,6 +146,6 @@ func (s *Service) OnConnect(ctx context.Context) error {
 
 func publishOne(b Broker, topic, payload string) {
 	if err := b.Publish(topic, []byte(payload), true); err != nil {
-		log.Printf("mqtt: publish %s: %v", topic, err)
+		slog.Error("mqtt: publish failed", "topic", topic, "err", err)
 	}
 }

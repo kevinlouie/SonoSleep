@@ -35,15 +35,44 @@ Implement top-down. One item per loop. Specs live in `.ralph/specs/`. Port DSP f
 - [x] Unit-test discovery payload JSON shape
 
 ## Phase 5 — Hardening & docs
-- [ ] Backoff/jitter on all reconnect loops; structured logging
-- [ ] Graceful shutdown (stop stream, media_stop, MQTT offline LWT)
-- [ ] README: setup, env, HA token creation, add MQTT integration, troubleshooting (714 MIME, drops)
-- [ ] Optional: fade-in on start (ramp gain ~3 s) to match reSpeakerSleep behavior
+- [x] Backoff/jitter on all reconnect loops; structured logging
+- [x] Graceful shutdown (stop stream, media_stop, MQTT offline LWT)
+- [x] README: setup, env, HA token creation, add MQTT integration, troubleshooting (714 MIME, drops)
+- [x] Optional: fade-in on start (ramp gain ~3 s) to match reSpeakerSleep behavior
 
 ## Completed
 - [x] Project enabled for Ralph
 - [x] Research prior art; architecture decided (see `projectplan.md`)
 - [x] Ralph files + specs written
+
+## Phase 5 — VERIFIED BY RUN (2026-06-20)
+- **Backoff/jitter + slog.** Audited all retry paths. `ha.waitAvailable` already had capped
+  exponential backoff + jitter; extracted the calc into a pure `backoffDelay(attempt, base,
+  max, jitter)` (internal/ha/util.go) so it's unit-tested (3 tests: exponential schedule,
+  jitter bounds [0.5·step, step], out-of-range clamp). MQTT reconnect uses paho's
+  auto-reconnect — added `SetMaxReconnectInterval(2m)` to cap its internal exponential
+  backoff and jittered the initial connect-retry interval (5s ±5s). Watchdog re-play is
+  ticker-gated (no tight loop) — left as-is. Migrated ALL `log.Printf`/`log.Fatalf` to
+  `log/slog` (key/value attrs) across ha, mqtt, stream, control wiring, main. New
+  `internal/logging` package: `Setup` installs a process-wide TextHandler at a configurable
+  level; `ParseLevel` parses HWN_LOG_LEVEL (debug|info|warn|error, default info) — unit-tested.
+- **Graceful shutdown.** Reordered main's shutdown into an explicit bounded sequence
+  (10s timeout): srv.Shutdown → MQTT PublishOffline → media_stop (if ON, reading ctrl state
+  before teardown) → mqttDisconnect (paho re-publishes offline + clean close). LWT still
+  covers ungraceful drops. No more reliance on defer ordering.
+- **README** rewritten as a full operator guide: what/architecture diagram/playback flow,
+  env table (→ .env.example), HA long-lived-token steps, adding the MQTT integration, the
+  three entities + topics (verified against internal/mqtt), Synology docker-compose deploy
+  (root compose, host network), and a Troubleshooting section covering UPnP 714 +
+  x-rincon-mp3radio:// fix, stream drops/watchdog, speaker unavailable, ffmpeg missing,
+  MQTT not connecting.
+- **Fade-in DONE (not deferred).** Judged low-risk: added an opt-in linear gain envelope to
+  `noise.Generator` via `NewWithFade(preset, FadeInDuration=3s)`; `noise.New` stays
+  fade-free so existing RMS/spectral tests are untouched. `stream.feed` uses the faded
+  constructor. 4 new envelope tests (no-fade default, ramp 0→0.5→1, early<steady RMS with
+  steady ≈ un-faded level, zero/negative disables).
+- `go build/vet ./...` clean, `gofmt -l .` empty, `go test ./...` + `go test -race ./...`
+  ALL pass (7 packages incl. new internal/logging).
 
 ## Notes
 - The Phase 2 manual Sonos test is the single biggest risk — do it before building

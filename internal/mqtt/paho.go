@@ -3,7 +3,8 @@ package mqtt
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"math/rand"
 	"time"
 
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
@@ -46,13 +47,19 @@ func (b *pahoBroker) Subscribe(topic string, handler func(payload []byte)) error
 // shutdown so a reconcile in flight unwinds). It returns the live Service and a
 // disconnect func for graceful shutdown (publish offline, then disconnect).
 func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*Service, func(), error) {
+	// Reconnect policy: paho's auto-reconnect uses capped exponential backoff
+	// between MaxReconnectInterval bounds; the initial connect retry is jittered
+	// (5s ± up to 5s) so a fleet of clients doesn't reconnect in lockstep after a
+	// broker restart.
+	retryInterval := time.Duration(float64(5*time.Second) * (1.0 + rand.Float64()))
 	opts := pahomqtt.NewClientOptions().
 		AddBroker(broker).
 		SetClientID("hwnsonos").
 		SetCleanSession(true).
 		SetAutoReconnect(true).
+		SetMaxReconnectInterval(2*time.Minute).
 		SetConnectRetry(true).
-		SetConnectRetryInterval(5*time.Second).
+		SetConnectRetryInterval(retryInterval).
 		SetWill(AvailabilityTopic, payloadOffline, 1, true)
 	if user != "" {
 		opts.SetUsername(user)
@@ -67,15 +74,15 @@ func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*
 	// On every (re)connect: re-subscribe and run the reconcile sequence.
 	opts.SetOnConnectHandler(func(_ pahomqtt.Client) {
 		if err := svc.Subscribe(ctx); err != nil {
-			log.Printf("mqtt: subscribe on connect: %v", err)
+			slog.Error("mqtt: subscribe on connect failed", "err", err)
 		}
 		if err := svc.OnConnect(ctx); err != nil {
-			log.Printf("mqtt: on-connect publish: %v", err)
+			slog.Error("mqtt: on-connect publish failed", "err", err)
 		}
-		log.Printf("mqtt: connected to %s (discovery + state published)", broker)
+		slog.Info("mqtt: connected (discovery + state published)", "broker", broker)
 	})
 	opts.SetConnectionLostHandler(func(_ pahomqtt.Client, err error) {
-		log.Printf("mqtt: connection lost: %v (will reconnect)", err)
+		slog.Warn("mqtt: connection lost, will reconnect with backoff", "err", err)
 	})
 
 	client := pahomqtt.NewClient(opts)
@@ -93,7 +100,7 @@ func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*
 		// Publish offline explicitly (retained) before a clean disconnect; the
 		// LWT only fires on ungraceful drops.
 		if err := svc.PublishOffline(); err != nil {
-			log.Printf("mqtt: publish offline on shutdown: %v", err)
+			slog.Warn("mqtt: publish offline on shutdown failed", "err", err)
 		}
 		client.Disconnect(250)
 	}

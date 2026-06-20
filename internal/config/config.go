@@ -22,6 +22,7 @@ type Config struct {
 	MQTTPass      string // HWN_MQTT_PASS (optional)
 	DefaultPreset string // HWN_DEFAULT_PRESET, one of white|pink|brown
 	DefaultVolume int    // HWN_DEFAULT_VOLUME, 0-100
+	LogLevel      string // HWN_LOG_LEVEL, one of debug|info|warn|error (default info)
 }
 
 var validPresets = map[string]bool{"white": true, "pink": true, "brown": true}
@@ -41,6 +42,7 @@ func Load() (*Config, error) {
 		MQTTPass:      os.Getenv("HWN_MQTT_PASS"),
 		DefaultPreset: getEnv("HWN_DEFAULT_PRESET", "brown"),
 		DefaultVolume: 80,
+		LogLevel:      getEnv("HWN_LOG_LEVEL", "info"),
 	}
 
 	var problems []string

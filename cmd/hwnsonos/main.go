@@ -12,7 +12,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,15 +22,27 @@ import (
 	"github.com/kevin/ha-white-noise-sonos/internal/config"
 	"github.com/kevin/ha-white-noise-sonos/internal/control"
 	"github.com/kevin/ha-white-noise-sonos/internal/ha"
+	"github.com/kevin/ha-white-noise-sonos/internal/logging"
 	"github.com/kevin/ha-white-noise-sonos/internal/mqtt"
 	"github.com/kevin/ha-white-noise-sonos/internal/noise"
 	"github.com/kevin/ha-white-noise-sonos/internal/stream"
 )
 
+// shutdownTimeout bounds the whole graceful-shutdown sequence (HTTP drain +
+// MQTT offline + media_stop + MQTT disconnect).
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("startup: %v", err)
+		// Logger not yet configured; use slog's default (stderr) and exit.
+		slog.Error("startup: config load failed", "err", err)
+		os.Exit(1)
+	}
+
+	_, levelOK := logging.Setup(cfg.LogLevel)
+	if !levelOK {
+		slog.Warn("unrecognized HWN_LOG_LEVEL, defaulting to info", "value", cfg.LogLevel)
 	}
 
 	// Config already validated DefaultPreset against white|pink|brown.
@@ -66,38 +78,50 @@ func main() {
 	// on-connect/reconnect reconcile (re-publish discovery, re-assert state).
 	mqttSvc, mqttDisconnect, err := mqtt.Connect(ctx, cfg.MQTTBroker, cfg.MQTTUser, cfg.MQTTPass, ctrl)
 	if err != nil {
-		log.Fatalf("mqtt: %v", err)
+		slog.Error("mqtt: connect failed", "err", err)
+		os.Exit(1)
 	}
-	defer mqttDisconnect()
-	_ = mqttSvc // state is published via the on-connect handler and command flow.
 
 	// Watchdog: re-play if the Sonos drops the stream while the switch is ON.
 	go watchdog.Run(ctx)
 
 	go func() {
-		log.Printf("hwnsonos listening on %s (preset=%s volume=%d target=%s)",
-			cfg.HTTPAddr, cfg.DefaultPreset, cfg.DefaultVolume, cfg.HAMediaPlayer)
+		slog.Info("hwnsonos listening",
+			"addr", cfg.HTTPAddr, "preset", cfg.DefaultPreset,
+			"volume", cfg.DefaultVolume, "target", cfg.HAMediaPlayer)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
+			slog.Error("http server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("shutting down")
+	slog.Info("shutting down")
 	stop() // restore default signal handling; a second signal now force-quits.
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Bounded, ordered shutdown:
+	//  1. Drain/stop the HTTP server so the Sonos stream connection ends.
+	//  2. Publish MQTT "offline" so HA shows the entities unavailable promptly.
+	//  3. If playback was ON, media_stop the Sonos (needs HA, not MQTT — state is
+	//     still read from ctrl before we tear anything down).
+	//  4. Disconnect MQTT (paho publishes offline again + closes cleanly).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// If playback is on, stop it on the Sonos before exiting.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("shutdown: http server", "err", err)
+	}
+
+	if err := mqttSvc.PublishOffline(); err != nil {
+		slog.Warn("shutdown: publish offline", "err", err)
+	}
+
 	if ctrl.IsOn() {
 		if err := haClient.MediaStop(shutdownCtx); err != nil {
-			log.Printf("shutdown: media_stop: %v", err)
+			slog.Error("shutdown: media_stop", "err", err)
 		}
 	}
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
-		os.Exit(1)
-	}
+	mqttDisconnect()
+	slog.Info("shutdown complete")
 }

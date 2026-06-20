@@ -2,7 +2,7 @@ package ha
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -82,7 +82,7 @@ func (w *Watchdog) Run(ctx context.Context) {
 func (w *Watchdog) tick(ctx context.Context) {
 	state, err := w.client.GetState(ctx)
 	if err != nil {
-		log.Printf("watchdog: get_state: %v", err)
+		slog.Warn("watchdog: get_state failed", "err", err)
 		return
 	}
 	prev := w.prevState
@@ -98,9 +98,9 @@ func (w *Watchdog) tick(ctx context.Context) {
 
 	switch state {
 	case StateIdle, StatePaused:
-		log.Printf("watchdog: target %s while ON — re-issuing play", state)
+		slog.Warn("watchdog: target stopped while ON, re-issuing play", "state", state)
 		if err := w.ctrl.Replay(ctx); err != nil {
-			log.Printf("watchdog: replay failed: %v", err)
+			slog.Error("watchdog: replay failed", "err", err)
 		}
 	case StatePlaying:
 		// Healthy, nothing to do.
@@ -110,9 +110,9 @@ func (w *Watchdog) tick(ctx context.Context) {
 		// Recovery edge: was unavailable, now something else (buffering/on) →
 		// nudge playback back.
 		if prev == StateUnavailable {
-			log.Printf("watchdog: target recovered from unavailable (now %q) while ON — re-issuing play", state)
+			slog.Info("watchdog: target recovered from unavailable while ON, re-issuing play", "state", state)
 			if err := w.ctrl.Replay(ctx); err != nil {
-				log.Printf("watchdog: replay failed: %v", err)
+				slog.Error("watchdog: replay failed", "err", err)
 			}
 		}
 	}

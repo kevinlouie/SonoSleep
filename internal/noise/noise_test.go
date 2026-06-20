@@ -3,6 +3,7 @@ package noise
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // decode renders n frames and returns the L-channel samples normalized back to
@@ -140,5 +141,82 @@ func TestVolumeGain(t *testing.T) {
 		if got := VolumeGain(level); math.Abs(got-want) > 1e-9 {
 			t.Errorf("VolumeGain(%d) = %v, want %v", level, got, want)
 		}
+	}
+}
+
+// TestNew_NoFade confirms the default constructor applies no fade: the very
+// first frames are already at full level (gain 1.0), so legacy callers and the
+// RMS/spectral tests are unaffected.
+func TestNew_NoFade(t *testing.T) {
+	g := New(White)
+	if g.fadeFrames != 0 {
+		t.Fatalf("New fadeFrames = %d, want 0", g.fadeFrames)
+	}
+	if got := g.fadeGain(); got != 1.0 {
+		t.Fatalf("New first-frame fadeGain = %v, want 1.0", got)
+	}
+}
+
+// TestNewWithFade_Envelope checks the ramp: gain starts at 0, rises linearly,
+// and reaches/stays at 1.0 after the configured duration.
+func TestNewWithFade_Envelope(t *testing.T) {
+	const fade = 100 * time.Millisecond
+	g := NewWithFade(White, fade)
+	wantFrames := uint64(float64(fade) / float64(time.Second) * SampleRate)
+	if g.fadeFrames != wantFrames {
+		t.Fatalf("fadeFrames = %d, want %d", g.fadeFrames, wantFrames)
+	}
+
+	// First frame: gain 0.
+	if got := g.fadeGain(); got != 0.0 {
+		t.Errorf("frame 0 gain = %v, want 0.0", got)
+	}
+	// Midpoint: ~0.5 (consume up to the middle).
+	half := wantFrames / 2
+	for i := uint64(1); i < half; i++ {
+		g.fadeGain()
+	}
+	mid := g.fadeGain()
+	if mid < 0.45 || mid > 0.55 {
+		t.Errorf("midpoint gain = %v, want ≈ 0.5", mid)
+	}
+	// Past the end: clamped at 1.0.
+	for i := half + 1; i <= wantFrames+10; i++ {
+		g.fadeGain()
+	}
+	if got := g.fadeGain(); got != 1.0 {
+		t.Errorf("post-ramp gain = %v, want 1.0", got)
+	}
+}
+
+// TestNewWithFade_AttenuatesStart verifies the fade actually lowers early
+// output energy relative to steady state, without changing steady-state level.
+func TestNewWithFade_AttenuatesStart(t *testing.T) {
+	const fade = 200 * time.Millisecond
+	g := NewWithFade(White, fade)
+	rampFrames := int(float64(fade) / float64(time.Second) * SampleRate)
+
+	early := rms(decode(t, g, rampFrames/4)) // first quarter of the ramp
+	// Skip the rest of the ramp, then measure steady state.
+	decode(t, g, rampFrames)
+	steady := rms(decode(t, g, 48000))
+
+	if early >= steady {
+		t.Errorf("early RMS %.3f should be < steady RMS %.3f during fade-in", early, steady)
+	}
+	// Steady-state must match the un-faded white level (≈0.25) within tolerance.
+	ref := rms(decode(t, New(White), 48000))
+	if steady < ref*0.9 || steady > ref*1.1 {
+		t.Errorf("post-fade steady RMS %.3f should ≈ un-faded %.3f", steady, ref)
+	}
+}
+
+// TestNewWithFade_ZeroDisables confirms a zero/negative fade disables the ramp.
+func TestNewWithFade_ZeroDisables(t *testing.T) {
+	if g := NewWithFade(Brown, 0); g.fadeFrames != 0 {
+		t.Errorf("zero fade: fadeFrames = %d, want 0", g.fadeFrames)
+	}
+	if g := NewWithFade(Brown, -5*time.Second); g.fadeFrames != 0 {
+		t.Errorf("negative fade: fadeFrames = %d, want 0", g.fadeFrames)
 	}
 }

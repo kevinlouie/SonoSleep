@@ -16,10 +16,11 @@ package stream
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/kevin/ha-white-noise-sonos/internal/noise"
 )
@@ -117,10 +118,11 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("stream: encoder start failed: %v", err)
+		slog.Error("stream: encoder start failed", "err", err)
 		http.Error(w, "encoder start failed", http.StatusInternalServerError)
 		return
 	}
+	slog.Info("stream: client connected", "preset", preset.String(), "remote", r.RemoteAddr)
 	// Reap on return — runs after copyAndFlush drains stdout, so no
 	// StdoutPipe-before-Wait deadlock.
 	defer func() {
@@ -155,7 +157,9 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // while the client is still connected.
 func feed(ctx context.Context, w io.WriteCloser, p noise.Preset) {
 	defer func() { _ = w.Close() }()
-	g := noise.New(p)
+	// Ease playback in with a short gain ramp (matches reSpeakerSleep) so the
+	// Sonos doesn't start at full level.
+	g := noise.NewWithFade(p, noise.FadeInDuration)
 	buf := make([]byte, blockFrames*noise.BytesPerFrame)
 	for {
 		select {
@@ -189,10 +193,11 @@ func copyAndFlush(w io.Writer, f http.Flusher, r io.Reader) {
 	}
 }
 
-// logWriter routes encoder stderr lines to the standard logger.
+// logWriter routes encoder stderr lines to the structured logger at warn level
+// (ffmpeg runs with -loglevel error, so any output here is a real problem).
 type logWriter struct{}
 
 func (logWriter) Write(p []byte) (int, error) {
-	log.Printf("ffmpeg: %s", p)
+	slog.Warn("ffmpeg", "msg", strings.TrimRight(string(p), "\n"))
 	return len(p), nil
 }

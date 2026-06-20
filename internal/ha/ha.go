@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -207,31 +208,31 @@ func (c *Client) callService(ctx context.Context, domain, service string, body a
 }
 
 // waitAvailable probes GetState and, while the target is unavailable, retries
-// with capped exponential backoff + jitter. It returns nil as soon as the target
-// is in any non-unavailable state, ErrUnavailable if it is still unavailable
-// after maxRetries, or the context error / underlying error otherwise.
+// with capped exponential backoff + jitter (see backoffDelay). It returns nil as
+// soon as the target is in any non-unavailable state, ErrUnavailable if it is
+// still unavailable after maxRetries, or the context error / underlying error
+// otherwise.
 func (c *Client) waitAvailable(ctx context.Context) error {
-	delay := c.baseDelay
 	for attempt := 0; ; attempt++ {
 		state, err := c.GetState(ctx)
 		if err != nil {
 			return err
 		}
 		if state != StateUnavailable {
+			if attempt > 0 {
+				slog.Info("ha: target became available", "entity", c.entityID, "attempts", attempt+1)
+			}
 			return nil
 		}
 		if attempt >= c.maxRetries {
 			return fmt.Errorf("%w (after %d attempts)", ErrUnavailable, attempt+1)
 		}
 
-		// Apply jitter: delay in [delay*0.5, delay*1.0) keeps it capped at delay.
-		j := time.Duration(float64(delay) * (0.5 + 0.5*c.jitter()))
-		if err := c.sleep(ctx, j); err != nil {
+		d := backoffDelay(attempt, c.baseDelay, c.maxDelay, c.jitter())
+		slog.Warn("ha: target unavailable, backing off",
+			"entity", c.entityID, "attempt", attempt+1, "max_retries", c.maxRetries, "delay", d)
+		if err := c.sleep(ctx, d); err != nil {
 			return err
-		}
-		delay *= 2
-		if delay > c.maxDelay {
-			delay = c.maxDelay
 		}
 	}
 }
