@@ -1,4 +1,4 @@
-# ha-white-noise-sonos
+# SonoSleep
 
 A small **Go service** that synthesizes continuous brown / pink / white noise (no audio
 files, no loop seam) and plays it to a **Sonos** speaker through Home Assistant.
