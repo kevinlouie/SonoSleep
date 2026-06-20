@@ -1,8 +1,12 @@
 # Deploy on the Synology HA host. host network so the Sonos can reach the stream
 # port and the service can reach the MQTT broker / HA REST API on the LAN.
+#
+# Pull (private GHCR) requires a one-time login on the host:
+#   echo <GHCR_PAT_with_read:packages> | docker login ghcr.io -u kevinlouie --password-stdin
+# For local development, swap `image:` for `build: .`.
 services:
   hwnsonos:
-    build: .
+    image: ghcr.io/kevinlouie/ha-white-noise-sonos:latest
     container_name: hwnsonos
     restart: unless-stopped
     network_mode: host
