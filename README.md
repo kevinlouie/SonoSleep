@@ -3,7 +3,7 @@
 A small **Go service** that synthesizes continuous brown / pink / white noise (no audio
 files, no loop seam) and plays it to a **Sonos** speaker through Home Assistant.
 
-It is the successor to [`../reSpeakerSleep`](../reSpeakerSleep) — same noise, but instead
+It is the successor to [reSpeakerSleep](https://github.com/kevinlouie/reSpeakerSleep) — same noise, but instead
 of generating it on an ESP32 and playing over a 3.5 mm jack, it generates server-side and
 streams straight to the Sonos over the LAN. The proven DSP (one-pole-lowpass brown, Paul
 Kellet pink) ports over directly.
