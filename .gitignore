@@ -58,3 +58,6 @@ target/
 .ralph/.loop_start_sha
 .ralph/.token_count
 .ralph/progress.json
+
+# Scratch smoke-test server (live Sonos testing, not shipped)
+cmd/smoke/

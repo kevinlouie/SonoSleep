@@ -36,6 +36,22 @@ server-side and stream it straight to the Sonos over the LAN. The proven DSP
 | Infinite-stream drop | **Watchdog**: Go watches the Sonos `media_player` state; if it goes `idle`/`paused` while the switch is ON, re-issue `play_media` (≈1–2 s gap) | Sonos can drop long HTTP streams. This is the reconnect strategy (Music Assistant would otherwise do it). |
 | Deploy | **Docker on the Synology HA host** | Same LAN as the Sonos and HA; mirrors the reSpeakerSleep/Wyoming stack pattern. |
 
+## Live end-to-end test (2026-06-20)
+Validated the real Go stream against the actual bedroom Sonos (entity
+`media_player.unnamed_room_unnamed_room`, friendly name "Unnamed Room" — NOT
+`media_player.bedroom`, which is a different unit named "Coffee"):
+- Brown noise audible and correct; held **~8 min continuous, zero reconnects/drops**.
+- `x-rincon-mp3radio://` scheme required (plain `http://` → UPnP 714 at the Sonos
+  control layer, before any fetch). Both `x-rincon-mp3radio://<host:port>/path` and
+  `x-rincon-mp3radio://http://<host:port>/path` work once reachable — `ha.MediaContentID`
+  (which emits the inner `http://`) is fine, no change needed.
+- The real blocker was the **dev box's `ufw`** dropping inbound :8099 → Sonos couldn't
+  fetch → URI fell back to `mms://` → UPnP 701. Not a URI bug, not a UniFi/network issue
+  (same /24, intra-VLAN). Deploy hosts must allow the stream port.
+- Unthrottled stream (relies on client TCP backpressure) did NOT over-buffer or stall.
+- Added ICY headers (`icy-name`, e.g. "Brown Noise (Local)") so the Sonos app shows a
+  real name instead of "Unknown Content".
+
 ## Architecture
 
 ```

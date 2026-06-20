@@ -141,6 +141,11 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Content-Type", "audio/mpeg")
 	h.Set("Cache-Control", "no-cache, no-store")
+	// ICY (Shoutcast/Icecast) station metadata. Sonos reads icy-name as the
+	// displayed source name; without it the app shows "Unknown Content".
+	h.Set("icy-name", stationName(preset))
+	h.Set("icy-genre", "White noise")
+	h.Set("icy-br", "192")
 	// "Connection: keep-alive" is a hop-by-hop header that Go's server manages
 	// itself; setting it here is a harmless no-op, kept to document intent.
 	h.Set("Connection", "keep-alive")
@@ -148,6 +153,21 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush() // emit headers immediately; Sonos times out slow starts.
 
 	copyAndFlush(w, flusher, stdout)
+}
+
+// stationName is the human-friendly name shown in the Sonos app (ICY icy-name),
+// e.g. "Brown Noise (Local)".
+func stationName(p noise.Preset) string {
+	switch p {
+	case noise.White:
+		return "White Noise (Local)"
+	case noise.Pink:
+		return "Pink Noise (Local)"
+	case noise.Brown:
+		return "Brown Noise (Local)"
+	default:
+		return "Noise (Local)"
+	}
 }
 
 // feed synthesizes PCM and writes it to the encoder's stdin. It returns when the
