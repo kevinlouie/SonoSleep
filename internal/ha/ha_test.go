@@ -63,11 +63,20 @@ func TestPlayMedia_RequestShape(t *testing.T) {
 	}
 
 	if len(calls) != 2 {
-		t.Fatalf("want 2 service calls (play_media, volume_set), got %d", len(calls))
+		t.Fatalf("want 2 service calls (volume_set, play_media), got %d", len(calls))
+	}
+
+	// volume_set comes FIRST so the Sonos never starts at its previous volume.
+	vs := calls[0]
+	if vs.path != "/api/services/media_player/volume_set" {
+		t.Errorf("first call path = %q, want volume_set", vs.path)
+	}
+	if got, ok := vs.body["volume_level"].(float64); !ok || got != 0.42 {
+		t.Errorf("volume_level = %v, want 0.42", vs.body["volume_level"])
 	}
 
 	// play_media
-	pm := calls[0]
+	pm := calls[1]
 	if pm.method != http.MethodPost {
 		t.Errorf("play_media method = %q, want POST", pm.method)
 	}
@@ -89,15 +98,6 @@ func TestPlayMedia_RequestShape(t *testing.T) {
 	}
 	if got := pm.body["media_content_type"]; got != "music" {
 		t.Errorf("media_content_type = %v, want music", got)
-	}
-
-	// volume_set
-	vs := calls[1]
-	if vs.path != "/api/services/media_player/volume_set" {
-		t.Errorf("volume_set path = %q", vs.path)
-	}
-	if got, ok := vs.body["volume_level"].(float64); !ok || got != 0.42 {
-		t.Errorf("volume_level = %v, want 0.42", vs.body["volume_level"])
 	}
 }
 
@@ -265,4 +265,167 @@ func decodeBody(t *testing.T, r *http.Request) map[string]any {
 		t.Fatalf("decode body %q: %v", data, err)
 	}
 	return m
+}
+
+func TestCallService_NotSentWhenAlreadyCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("request sent despite cancelled ctx: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.MediaStop(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("MediaStop err = %v, want context.Canceled", err)
+	}
+}
+
+func TestCallService_SentCallBoundedByTimeout(t *testing.T) {
+	// A sent POST ignores caller cancellation, but must still give up after
+	// callTimeout so shutdown stays bounded.
+	entered := make(chan struct{})
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(hang)
+
+	c := newTestClient(t, srv.URL)
+	c.callTimeout = 100 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	begin := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- c.MediaStop(ctx) }()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("MediaStop err = nil, want timeout error")
+		}
+		if d := time.Since(begin); d < 80*time.Millisecond {
+			t.Errorf("returned after %v: aborted on caller cancel instead of waiting for the call", d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sent call not bounded by callTimeout")
+	}
+}
+
+func TestCallService_ErrOutcomeUnknownOnlyAfterSend(t *testing.T) {
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/services/media_player/volume_set" {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		<-hang
+	}))
+	defer srv.Close()
+	defer close(hang)
+
+	c := newTestClient(t, srv.URL)
+	c.callTimeout = 50 * time.Millisecond
+
+	// Sent, no response before the timeout: outcome unknown.
+	if err := c.MediaStop(context.Background()); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("timed-out call err = %v, want ErrOutcomeUnknown", err)
+	}
+	// Refused before sending (ctx already cancelled): a definite failure.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.MediaStop(ctx); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("pre-send cancel err = %v, want a non-ErrOutcomeUnknown error", err)
+	}
+	// HA answered with an error status: a definite failure.
+	if err := c.VolumeSet(context.Background(), 10); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("500 err = %v, want a non-ErrOutcomeUnknown error", err)
+	}
+}
+
+func TestPlayMedia_VolumeSetUnknownIsNotPlayUnknown(t *testing.T) {
+	// If volume_set times out, play_media was never sent: PlayMedia's error
+	// must not claim the play's outcome is unknown.
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/states/media_player.bedroom":
+			_, _ = io.WriteString(w, `{"state":"idle"}`)
+		case "/api/services/media_player/play_media":
+			t.Error("play_media sent after volume_set failed")
+		default:
+			<-hang
+		}
+	}))
+	defer srv.Close()
+	defer close(hang)
+
+	c := newTestClient(t, srv.URL)
+	c.callTimeout = 50 * time.Millisecond
+	err := c.PlayMedia(context.Background(), "brown", 10)
+	if err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("PlayMedia err = %v, want a non-ErrOutcomeUnknown error", err)
+	}
+}
+
+func TestCallService_CallerDeadlineShortensTimeout(t *testing.T) {
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hang
+	}))
+	defer srv.Close()
+	defer close(hang)
+
+	c := newTestClient(t, srv.URL) // callTimeout stays at the 4 s default
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	if err := c.MediaStop(ctx); err == nil {
+		t.Fatal("MediaStop err = nil, want deadline error")
+	}
+	if d := time.Since(begin); d > time.Second {
+		t.Errorf("took %v, want about the caller's 100ms deadline", d)
+	}
+}
+
+func TestPlayMedia_CancelMidRequestStillCompletes(t *testing.T) {
+	// Once play_media is on the wire, cancelling the caller's ctx must not
+	// abort it (HA could still execute it later, out of order); the call
+	// completes and its response is awaited.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handlerCtxErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/states/media_player.bedroom":
+			_, _ = io.WriteString(w, `{"state":"idle"}`)
+		case "/api/services/media_player/play_media":
+			close(entered)
+			<-release
+			handlerCtxErr <- r.Context().Err()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.PlayMedia(ctx, "brown", 50) }()
+	<-entered
+	cancel()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("PlayMedia err = %v, want nil (in-flight POST completes)", err)
+	}
+	if err := <-handlerCtxErr; err != nil {
+		t.Errorf("server saw the play_media request aborted: %v", err)
+	}
 }

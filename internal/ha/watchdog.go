@@ -9,6 +9,12 @@ import (
 // defaultWatchdogInterval is how often the watchdog polls the Sonos state.
 const defaultWatchdogInterval = 10 * time.Second
 
+// idlePollsBeforeReplay is how many consecutive idle/paused polls (while ON and
+// not suppressed) the watchdog needs before it requests a re-play. One poll is
+// not enough: right after play_media the Sonos can still report idle while it
+// buffers, and re-playing then would restart the stream and its fade-in.
+const idlePollsBeforeReplay = 2
+
 // Controller is the minimal view of the service's control state the watchdog
 // needs. Phase 4 (MQTT) supplies the real implementation; this keeps the
 // watchdog from hard-depending on MQTT. All methods must be safe to call from the
@@ -18,19 +24,20 @@ type Controller interface {
 	// only re-plays while this is true.
 	IsOn() bool
 	// SuppressedUntil returns the instant before which the watchdog must NOT
-	// re-play, even if the Sonos looks idle. Set after a deliberate stop or a
-	// known interruption (TTS/alarm announcement) so the watchdog doesn't fight
-	// it. A zero time means "not suppressed".
+	// re-play, even if the Sonos looks idle. Set every time a play is issued so
+	// the watchdog doesn't mistake the Sonos buffering for a dropped stream. A
+	// zero time means "not suppressed".
 	SuppressedUntil() time.Time
-	// Replay re-issues playback (play_media + volume_set). The watchdog calls
-	// this when it detects an unexpected idle/paused or a recovery from
-	// unavailable while ON.
-	Replay(ctx context.Context) error
+	// Replay requests that playback be re-issued (volume_set + play_media) if the
+	// switch is still ON. It must not block: the HA calls happen on the
+	// controller's own goroutine. The watchdog calls this when it detects an
+	// unexpected idle/paused or a recovery from unavailable while ON.
+	Replay()
 }
 
-// Watchdog polls the target media_player and re-issues playback when the Sonos
-// unexpectedly stops (idle/paused) or recovers from unavailable while the service
-// switch is ON. Construct with NewWatchdog.
+// Watchdog polls the target media_player and requests a re-play when the Sonos
+// unexpectedly stops (idle/paused on consecutive polls) or recovers from
+// unavailable while the service switch is ON. Construct with NewWatchdog.
 type Watchdog struct {
 	client   stateGetter
 	ctrl     Controller
@@ -40,6 +47,8 @@ type Watchdog struct {
 	// prevState is the last observed state, used to detect the unavailable→
 	// available recovery edge.
 	prevState string
+	// idleStreak counts consecutive idle/paused polls while ON and not suppressed.
+	idleStreak int
 }
 
 // stateGetter is the subset of *Client the watchdog uses. Lets tests inject a
@@ -89,31 +98,39 @@ func (w *Watchdog) tick(ctx context.Context) {
 	w.prevState = state
 
 	if !w.ctrl.IsOn() {
+		w.idleStreak = 0
 		return // switch is OFF: intended stop, never re-play.
 	}
+	if prev == StateUnavailable && state != StateUnavailable && state != StatePlaying {
+		// Recovery edge: was unavailable, now something else (idle/buffering/on)
+		// → nudge playback back straight away. Checked before the suppress
+		// window, which is about buffering after a play and must not swallow a
+		// one-off edge.
+		w.idleStreak = 0
+		slog.Info("watchdog: target recovered from unavailable while ON, requesting play", "state", state)
+		w.ctrl.Replay()
+		return
+	}
 	if until := w.ctrl.SuppressedUntil(); !until.IsZero() && w.now().Before(until) {
-		// Deliberate stop / announcement window: don't fight it.
+		// A play was just issued (Sonos may still be buffering): don't fight it.
+		w.idleStreak = 0
 		return
 	}
 
 	switch state {
+	case StatePlaying, StateUnavailable:
+		// Healthy, or still off (the controller's retry handles bring-up).
+		w.idleStreak = 0
 	case StateIdle, StatePaused:
-		slog.Warn("watchdog: target stopped while ON, re-issuing play", "state", state)
-		if err := w.ctrl.Replay(ctx); err != nil {
-			slog.Error("watchdog: replay failed", "err", err)
+		w.idleStreak++
+		if w.idleStreak < idlePollsBeforeReplay {
+			slog.Debug("watchdog: target stopped while ON, confirming on next poll", "state", state)
+			return
 		}
-	case StatePlaying:
-		// Healthy, nothing to do.
-	case StateUnavailable:
-		// Still off; nothing to do (PlayMedia's own backoff handles bring-up).
+		w.idleStreak = 0
+		slog.Warn("watchdog: target stopped while ON, requesting play", "state", state)
+		w.ctrl.Replay()
 	default:
-		// Recovery edge: was unavailable, now something else (buffering/on) →
-		// nudge playback back.
-		if prev == StateUnavailable {
-			slog.Info("watchdog: target recovered from unavailable while ON, re-issuing play", "state", state)
-			if err := w.ctrl.Replay(ctx); err != nil {
-				slog.Error("watchdog: replay failed", "err", err)
-			}
-		}
+		w.idleStreak = 0
 	}
 }

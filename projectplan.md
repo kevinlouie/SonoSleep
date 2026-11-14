@@ -74,9 +74,10 @@ Synology docker host
 
 ### Playback flow
 1. User flips the **White Noise** switch ON in HA → MQTT command → Go.
-2. Go calls HA `media_player.play_media` on `media_player.bedroom` with
+2. Go calls HA `media_player.volume_set` to the number entity first, then
+   `media_player.play_media` on `media_player.bedroom` with
    `media_content_id = http://<host>:<port>/stream?preset=<current>`,
-   `media_content_type = music`, then `media_player.volume_set` to the number entity.
+   `media_content_type = music` (volume first, or the Sonos briefly starts at its old volume).
 3. Sonos opens the stream; Go's HTTP handler starts a per-connection noise→ffmpeg→MP3
    pipeline and streams it indefinitely.
 4. Watchdog: if the Sonos reports `idle`/`paused`/`unavailable→available` while the

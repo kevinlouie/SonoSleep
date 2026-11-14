@@ -87,8 +87,8 @@ func TestLoadFadeIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.FadeInSeconds != 10 {
-		t.Errorf("default FadeInSeconds = %d, want 10", c.FadeInSeconds)
+	if c.FadeInSeconds != 3 {
+		t.Errorf("default FadeInSeconds = %d, want 3", c.FadeInSeconds)
 	}
 
 	t.Setenv("HWN_FADE_IN_SECONDS", "0")

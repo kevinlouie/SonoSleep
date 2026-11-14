@@ -77,10 +77,10 @@ const (
 	brownCoef = 0.015 // one-pole a → fc = a*fs/2π ≈ 115 Hz
 )
 
-// FadeInDuration is the default fade-in ramp length at stream start. Long enough
-// that the Sonos (which buffers a few seconds before it starts playing) eases in
-// gently instead of snapping from silence to full level.
-const FadeInDuration = 10 * time.Second
+// FadeInDuration is the default fade-in ramp length at stream start: a short ease
+// so playback doesn't snap from silence to full level, without making the user
+// wait long for the noise to reach its set volume.
+const FadeInDuration = 3 * time.Second
 
 // Generator produces an endless stream of one preset. It is NOT safe for
 // concurrent use; create one per stream connection. To change preset mid-stream

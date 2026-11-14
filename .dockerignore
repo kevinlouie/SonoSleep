@@ -1,0 +1,10 @@
+.git
+.ralph
+.claude
+cmd/smoke
+*.md
+.env
+.env.example
+.gitignore
+.dockerignore
+.ralphrc

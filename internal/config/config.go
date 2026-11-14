@@ -22,7 +22,7 @@ type Config struct {
 	MQTTPass      string // HWN_MQTT_PASS (optional)
 	DefaultPreset string // HWN_DEFAULT_PRESET, one of white|pink|brown
 	DefaultVolume int    // HWN_DEFAULT_VOLUME, 0-100
-	FadeInSeconds int    // HWN_FADE_IN_SECONDS, 0-120 (0 disables), default 10
+	FadeInSeconds int    // HWN_FADE_IN_SECONDS, 0-120 (0 disables), default 3
 	LogLevel      string // HWN_LOG_LEVEL, one of debug|info|warn|error (default info)
 }
 
@@ -43,7 +43,7 @@ func Load() (*Config, error) {
 		MQTTPass:      os.Getenv("HWN_MQTT_PASS"),
 		DefaultPreset: getEnv("HWN_DEFAULT_PRESET", "brown"),
 		DefaultVolume: 80,
-		FadeInSeconds: 10,
+		FadeInSeconds: 3,
 		LogLevel:      getEnv("HWN_LOG_LEVEL", "info"),
 	}
 

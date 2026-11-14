@@ -31,30 +31,66 @@ type fakeCtrl struct {
 	on         bool
 	suppressed time.Time
 	replays    int
-	replayErr  error
 }
 
-func (c *fakeCtrl) IsOn() bool                   { return c.on }
-func (c *fakeCtrl) SuppressedUntil() time.Time   { return c.suppressed }
-func (c *fakeCtrl) Replay(context.Context) error { c.replays++; return c.replayErr }
+func (c *fakeCtrl) IsOn() bool                 { return c.on }
+func (c *fakeCtrl) SuppressedUntil() time.Time { return c.suppressed }
+func (c *fakeCtrl) Replay()                    { c.replays++ }
 
 func newWD(states []string, ctrl *fakeCtrl) *Watchdog {
 	w := NewWatchdog(&fakeState{states: states}, ctrl, time.Hour)
 	return w
 }
 
-func TestWatchdog_IdleWhileOn_Replays(t *testing.T) {
+// ticks runs n watchdog polls.
+func ticks(w *Watchdog, n int) {
+	for i := 0; i < n; i++ {
+		w.tick(context.Background())
+	}
+}
+
+func TestWatchdog_IdleWhileOn_ReplaysAfterTwoPolls(t *testing.T) {
 	ctrl := &fakeCtrl{on: true}
 	w := newWD([]string{"idle"}, ctrl)
 	w.tick(context.Background())
+	if ctrl.replays != 0 {
+		t.Fatalf("after 1 idle poll: replays = %d, want 0 (may still be buffering)", ctrl.replays)
+	}
+	w.tick(context.Background())
+	if ctrl.replays != 1 {
+		t.Fatalf("after 2 idle polls: replays = %d, want 1", ctrl.replays)
+	}
+}
+
+func TestWatchdog_PausedWhileOn_ReplaysAfterTwoPolls(t *testing.T) {
+	ctrl := &fakeCtrl{on: true}
+	w := newWD([]string{"paused"}, ctrl)
+	ticks(w, 2)
 	if ctrl.replays != 1 {
 		t.Fatalf("replays = %d, want 1", ctrl.replays)
 	}
 }
 
-func TestWatchdog_PausedWhileOn_Replays(t *testing.T) {
+func TestWatchdog_IdleStreakResetByPlaying(t *testing.T) {
 	ctrl := &fakeCtrl{on: true}
-	w := newWD([]string{"paused"}, ctrl)
+	w := newWD([]string{"idle", "playing", "idle"}, ctrl)
+	ticks(w, 3)
+	if ctrl.replays != 0 {
+		t.Fatalf("replays = %d, want 0 (idle polls not consecutive)", ctrl.replays)
+	}
+}
+
+func TestWatchdog_IdleStreakResetBySuppression(t *testing.T) {
+	ctrl := &fakeCtrl{on: true}
+	w := newWD([]string{"idle"}, ctrl)
+	w.tick(context.Background()) // streak 1
+	ctrl.suppressed = time.Now().Add(time.Minute)
+	w.tick(context.Background()) // suppressed: resets streak
+	ctrl.suppressed = time.Time{}
+	w.tick(context.Background()) // streak 1 again
+	if ctrl.replays != 0 {
+		t.Fatalf("replays = %d, want 0 (suppression resets the idle streak)", ctrl.replays)
+	}
 	w.tick(context.Background())
 	if ctrl.replays != 1 {
 		t.Fatalf("replays = %d, want 1", ctrl.replays)
@@ -64,7 +100,7 @@ func TestWatchdog_PausedWhileOn_Replays(t *testing.T) {
 func TestWatchdog_IdleWhileOff_NoReplay(t *testing.T) {
 	ctrl := &fakeCtrl{on: false}
 	w := newWD([]string{"idle"}, ctrl)
-	w.tick(context.Background())
+	ticks(w, 3)
 	if ctrl.replays != 0 {
 		t.Fatalf("replays = %d, want 0 (switch off)", ctrl.replays)
 	}
@@ -74,7 +110,7 @@ func TestWatchdog_Suppressed_NoReplay(t *testing.T) {
 	ctrl := &fakeCtrl{on: true, suppressed: time.Now().Add(time.Minute)}
 	w := newWD([]string{"idle"}, ctrl)
 	w.now = func() time.Time { return time.Now() }
-	w.tick(context.Background())
+	ticks(w, 3)
 	if ctrl.replays != 0 {
 		t.Fatalf("replays = %d, want 0 (suppressed)", ctrl.replays)
 	}
@@ -83,7 +119,7 @@ func TestWatchdog_Suppressed_NoReplay(t *testing.T) {
 func TestWatchdog_SuppressionExpired_Replays(t *testing.T) {
 	ctrl := &fakeCtrl{on: true, suppressed: time.Now().Add(-time.Minute)}
 	w := newWD([]string{"idle"}, ctrl)
-	w.tick(context.Background())
+	ticks(w, 2)
 	if ctrl.replays != 1 {
 		t.Fatalf("replays = %d, want 1 (suppression expired)", ctrl.replays)
 	}
@@ -109,6 +145,24 @@ func TestWatchdog_RecoverFromUnavailable_Replays(t *testing.T) {
 	w.tick(context.Background())
 	if ctrl.replays != 1 {
 		t.Fatalf("after recovery: replays = %d, want 1", ctrl.replays)
+	}
+}
+
+func TestWatchdog_RecoverFromUnavailableToIdle_ReplaysImmediately(t *testing.T) {
+	ctrl := &fakeCtrl{on: true}
+	w := newWD([]string{"unavailable", "idle"}, ctrl)
+	ticks(w, 2)
+	if ctrl.replays != 1 {
+		t.Fatalf("replays = %d, want 1 (recovery edge needs no second idle poll)", ctrl.replays)
+	}
+}
+
+func TestWatchdog_RecoveryEdgeNotSwallowedBySuppression(t *testing.T) {
+	ctrl := &fakeCtrl{on: true, suppressed: time.Now().Add(time.Minute)}
+	w := newWD([]string{"unavailable", "idle"}, ctrl)
+	ticks(w, 2)
+	if ctrl.replays != 1 {
+		t.Fatalf("replays = %d, want 1 (recovery edge must bypass the suppress window)", ctrl.replays)
 	}
 }
 
