@@ -34,6 +34,14 @@ const (
 	// 4096 frames ≈ 85 ms at 48 kHz: small enough to start fast and flush
 	// smoothly, large enough to keep syscall overhead negligible.
 	blockFrames = 4096
+	// defaultBurst is how far ahead of real time the feeder may run: a short
+	// Icecast-style burst-on-connect so the Sonos can fill its start-up buffer,
+	// then strictly real-time. Keep it well inside the fade-in: the Sonos opens
+	// a throwaway first connection (~0.1–1 s) before the one it keeps, and
+	// whatever audio that first connection received must still be near-silent.
+	// Unpaced, it received minutes of full-level audio in that window, and a
+	// short loud burst was audible before the kept connection's fade-in.
+	defaultBurst = 1 * time.Second
 )
 
 // Streamer is the /stream HTTP handler. Construct with New.
@@ -47,6 +55,10 @@ type Streamer struct {
 	// FadeIn is the gain ramp applied at the start of each connection
 	// (default noise.FadeInDuration). Zero disables it.
 	FadeIn time.Duration
+	// Burst is how much audio may be sent ahead of real time (default
+	// defaultBurst). After that the feeder is paced to real time. Negative
+	// disables pacing (tests only).
+	Burst time.Duration
 
 	// encoderCmd builds the encoder process. Overridable in tests to inject a
 	// fake (e.g. `cat`) so teardown can be exercised without real ffmpeg.
@@ -65,6 +77,7 @@ func New(defaultPreset noise.Preset) *Streamer {
 		Bitrate:       defaultBitrate,
 		DefaultPreset: defaultPreset,
 		FadeIn:        noise.FadeInDuration,
+		Burst:         defaultBurst,
 	}
 	s.encoderCmd = s.ffmpegCmd
 	return s
@@ -128,10 +141,14 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("stream: client connected", "preset", preset.String(), "remote", r.RemoteAddr)
+	start := time.Now()
+	var sent int64
 	// Reap on return — runs after copyAndFlush drains stdout, so no
 	// StdoutPipe-before-Wait deadlock.
 	defer func() {
 		_ = cmd.Wait()
+		slog.Info("stream: client disconnected", "preset", preset.String(), "remote", r.RemoteAddr,
+			"duration", time.Since(start).Round(time.Millisecond), "bytes", sent)
 		if s.onStreamEnd != nil {
 			s.onStreamEnd()
 		}
@@ -139,7 +156,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Feed synthesized PCM into the encoder until the client disconnects or the
 	// encoder dies.
-	go feed(ctx, stdin, preset, s.FadeIn)
+	go feed(ctx, stdin, preset, s.FadeIn, s.Burst)
 
 	// Radio-stream headers. NO Content-Length → Go uses chunked encoding, which
 	// makes Sonos treat this as an endless stream, not a finite track.
@@ -157,7 +174,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // emit headers immediately; Sonos times out slow starts.
 
-	copyAndFlush(w, flusher, stdout)
+	sent = copyAndFlush(w, flusher, stdout)
 }
 
 // stationName is the human-friendly name shown in the Sonos app (ICY icy-name),
@@ -180,13 +197,37 @@ func stationName(p noise.Preset) string {
 // write fails (ffmpeg exited on its own). The two exit paths are independent:
 // the ctx check covers idle cancellation, the write error covers ffmpeg dying
 // while the client is still connected.
-func feed(ctx context.Context, w io.WriteCloser, p noise.Preset, fade time.Duration) {
+//
+// Pacing: after an initial burst of `burst` audio, PCM is produced no faster
+// than real time (the encoder adds only a few frames of latency, so the MP3
+// leaving the server is paced too). A negative burst disables pacing.
+func feed(ctx context.Context, w io.WriteCloser, p noise.Preset, fade, burst time.Duration) {
 	defer func() { _ = w.Close() }()
 	// Ease playback in with a gain ramp so the Sonos doesn't snap from silence
 	// to full level once its start-up buffering finishes.
 	g := noise.NewWithFade(p, fade)
 	buf := make([]byte, blockFrames*noise.BytesPerFrame)
+	start := time.Now()
+	var frames int64 // frames written so far
 	for {
+		if burst >= 0 {
+			// Audio already written covers frames/SampleRate seconds; it may lead
+			// the wall clock by at most burst.
+			// Split seconds and remainder so the Duration math can't overflow on
+			// a stream left running for days.
+			written := time.Duration(frames/noise.SampleRate)*time.Second +
+				time.Duration(frames%noise.SampleRate)*time.Second/noise.SampleRate
+			lead := written - burst - time.Since(start)
+			if lead > 0 {
+				t := time.NewTimer(lead)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					return
+				case <-t.C:
+				}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -196,24 +237,27 @@ func feed(ctx context.Context, w io.WriteCloser, p noise.Preset, fade time.Durat
 		if _, err := w.Write(buf); err != nil {
 			return
 		}
+		frames += blockFrames
 	}
 }
 
 // copyAndFlush streams r to w, flushing after every block so the Sonos receives
-// audio with minimal latency. Returns when r reaches EOF (encoder gone) or the
-// write to the client fails (client gone).
-func copyAndFlush(w io.Writer, f http.Flusher, r io.Reader) {
+// audio with minimal latency. Returns the bytes delivered when r reaches EOF
+// (encoder gone) or the write to the client fails (client gone).
+func copyAndFlush(w io.Writer, f http.Flusher, r io.Reader) int64 {
 	buf := make([]byte, 32*1024)
+	var total int64
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return total
 			}
+			total += int64(n)
 			f.Flush()
 		}
 		if rerr != nil {
-			return
+			return total
 		}
 	}
 }

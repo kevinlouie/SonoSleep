@@ -102,6 +102,49 @@ func TestServeHTTP_HeadersAndStream(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_PacedToRealTime verifies the feeder sends at most Burst ahead of
+// real time: with the `cat` encoder the body is raw PCM, so bytes received over
+// a window are bounded by (burst + elapsed + one block) of audio. Unpaced, the
+// first connection got minutes of audio within a second.
+func TestServeHTTP_PacedToRealTime(t *testing.T) {
+	s := catStreamer(t)
+	s.Burst = 100 * time.Millisecond
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/stream", nil)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	const window = 400 * time.Millisecond
+	var got int64
+	buf := make([]byte, 4096)
+	for time.Since(start) < window {
+		n, err := resp.Body.Read(buf)
+		got += int64(n)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+	const bytesPerSec = noise.SampleRate * noise.BytesPerFrame
+	block := int64(blockFrames * noise.BytesPerFrame)
+	max := int64((s.Burst+elapsed).Seconds()*bytesPerSec) + block
+	if got > max {
+		t.Fatalf("received %d bytes in %v, want <= %d (burst %v + real time)", got, elapsed, max, s.Burst)
+	}
+	// And it must actually be streaming, not stalled: at least the burst.
+	if min := int64(s.Burst.Seconds() * bytesPerSec); got < min {
+		t.Fatalf("received %d bytes in %v, want >= %d (the burst)", got, elapsed, min)
+	}
+}
+
 // TestServeHTTP_Teardown verifies the handler returns and the encoder process is
 // gone after the client disconnects mid-stream — the "no leaks" requirement.
 func TestServeHTTP_Teardown(t *testing.T) {
