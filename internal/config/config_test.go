@@ -81,6 +81,27 @@ func TestLoadInvalidPresetAndVolume(t *testing.T) {
 	}
 }
 
+func TestLoadUnmuteDelay(t *testing.T) {
+	setRequired(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UnmuteDelayMs != 300 {
+		t.Errorf("default UnmuteDelayMs = %d, want 300", c.UnmuteDelayMs)
+	}
+	t.Setenv("HWN_UNMUTE_DELAY_MS", "1000")
+	if c, err = Load(); err != nil || c.UnmuteDelayMs != 1000 {
+		t.Errorf("HWN_UNMUTE_DELAY_MS=1000: got %v, %v; want 1000, nil", c, err)
+	}
+	for _, bad := range []string{"-1", "5001", "soon"} {
+		t.Setenv("HWN_UNMUTE_DELAY_MS", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "HWN_UNMUTE_DELAY_MS") {
+			t.Errorf("HWN_UNMUTE_DELAY_MS=%q: err = %v, want complaint", bad, err)
+		}
+	}
+}
+
 func TestLoadFadeIn(t *testing.T) {
 	setRequired(t)
 	c, err := Load()

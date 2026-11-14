@@ -48,11 +48,12 @@ const (
 	// unmuting anyway (a stuck mute is worse than a blip).
 	defaultStartWait = 15 * time.Second
 	// defaultStartPoll is the GetState poll interval while waiting.
-	defaultStartPoll = 250 * time.Millisecond
+	defaultStartPoll = 100 * time.Millisecond
 	// defaultUnmuteDelay is how long after "playing" the mute is held: the blip
 	// can land just after the state flips, and the stream's fade-in is still
-	// near-silent this early, so nothing audible is lost.
-	defaultUnmuteDelay = 1 * time.Second
+	// near-silent this early, so nothing audible is lost. Overridable with
+	// SetUnmuteDelay (config HWN_UNMUTE_DELAY_MS).
+	defaultUnmuteDelay = 300 * time.Millisecond
 	// unmuteTimeout bounds the (detached) unmute call, so a cancelled play
 	// costs at most play POST + unmute within shutdown's reconciler wait.
 	unmuteTimeout = 2 * time.Second
@@ -123,6 +124,15 @@ func New(baseURL, token, entityID, publicBase string) *Client {
 		unmuteDelay: defaultUnmuteDelay,
 	}
 	return c
+}
+
+// SetUnmuteDelay sets how long the start-up mute is held after the target
+// reports playing (negative is treated as 0). Call before use.
+func (c *Client) SetUnmuteDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	c.unmuteDelay = d
 }
 
 // EntityID returns the target media_player entity id.

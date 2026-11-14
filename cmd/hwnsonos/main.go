@@ -63,6 +63,7 @@ func main() {
 
 	// HA REST client → authoritative control state → watchdog uses the same state.
 	haClient := ha.New(cfg.HABaseURL, cfg.HAToken, cfg.HAMediaPlayer, cfg.PublicBaseURL)
+	haClient.SetUnmuteDelay(time.Duration(cfg.UnmuteDelayMs) * time.Millisecond)
 	ctrl := control.New(haClient, cfg.DefaultPreset, cfg.DefaultVolume)
 	watchdog := ha.NewWatchdog(haClient, ctrl, 0)
 
