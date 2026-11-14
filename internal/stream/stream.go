@@ -34,14 +34,13 @@ const (
 	// 4096 frames ≈ 85 ms at 48 kHz: small enough to start fast and flush
 	// smoothly, large enough to keep syscall overhead negligible.
 	blockFrames = 4096
-	// defaultBurst is how far ahead of real time the feeder may run: a short
-	// Icecast-style burst-on-connect so the Sonos can fill its start-up buffer,
-	// then strictly real-time. Keep it well inside the fade-in: the Sonos opens
-	// a throwaway first connection (~0.1–1 s) before the one it keeps, and
-	// whatever audio that first connection received must still be near-silent.
-	// Unpaced, it received minutes of full-level audio in that window, and a
-	// short loud burst was audible before the kept connection's fade-in.
-	defaultBurst = 1 * time.Second
+	// defaultBurst is how far ahead of real time the feeder may run: an
+	// Icecast-style burst-on-connect so the Sonos fills its start-up buffer
+	// immediately, then real time. 10 s keeps start latency the same as
+	// unpaced (a 1 s burst made the Sonos visibly slower to start) while no
+	// longer pushing minutes of audio into each connection. (The start-up blip
+	// is the Sonos's own and is handled by muting in ha.PlayMedia, not here.)
+	defaultBurst = 10 * time.Second
 )
 
 // Streamer is the /stream HTTP handler. Construct with New.

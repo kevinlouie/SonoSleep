@@ -21,6 +21,7 @@ func newTestClient(t *testing.T, baseURL string) *Client {
 	c.maxDelay = time.Millisecond
 	c.jitter = func() float64 { return 0 }
 	c.sleep = func(context.Context, time.Duration) error { return nil } // never actually sleep
+	c.startWait = 100 * time.Millisecond
 	return c
 }
 
@@ -62,21 +63,28 @@ func TestPlayMedia_RequestShape(t *testing.T) {
 		t.Fatalf("PlayMedia: %v", err)
 	}
 
-	if len(calls) != 2 {
-		t.Fatalf("want 2 service calls (volume_set, play_media), got %d", len(calls))
+	// mute, volume_set, play_media, then (once playing) unmute.
+	if len(calls) != 4 {
+		t.Fatalf("want 4 service calls (mute, volume_set, play_media, unmute), got %d", len(calls))
+	}
+	if m := calls[0]; m.path != "/api/services/media_player/volume_mute" || m.body["is_volume_muted"] != true {
+		t.Errorf("first call = %s %v, want volume_mute true", m.path, m.body)
+	}
+	if u := calls[3]; u.path != "/api/services/media_player/volume_mute" || u.body["is_volume_muted"] != false {
+		t.Errorf("last call = %s %v, want volume_mute false", u.path, u.body)
 	}
 
-	// volume_set comes FIRST so the Sonos never starts at its previous volume.
-	vs := calls[0]
+	// volume_set comes BEFORE play so the Sonos never starts at its previous volume.
+	vs := calls[1]
 	if vs.path != "/api/services/media_player/volume_set" {
-		t.Errorf("first call path = %q, want volume_set", vs.path)
+		t.Errorf("second call path = %q, want volume_set", vs.path)
 	}
 	if got, ok := vs.body["volume_level"].(float64); !ok || got != 0.42 {
 		t.Errorf("volume_level = %v, want 0.42", vs.body["volume_level"])
 	}
 
 	// play_media
-	pm := calls[1]
+	pm := calls[2]
 	if pm.method != http.MethodPost {
 		t.Errorf("play_media method = %q, want POST", pm.method)
 	}
@@ -98,6 +106,154 @@ func TestPlayMedia_RequestShape(t *testing.T) {
 	}
 	if got := pm.body["media_content_type"]; got != "music" {
 		t.Errorf("media_content_type = %v, want music", got)
+	}
+}
+
+// muteServer records service-call paths + bodies and answers GET state with
+// whatever states() returns.
+func muteServer(t *testing.T, states func() string, hold func(path string)) (*httptest.Server, func() []capturedCall) {
+	t.Helper()
+	var mu sync.Mutex
+	var calls []capturedCall
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, states())
+			return
+		}
+		body := decodeBody(t, r)
+		if hold != nil {
+			hold(r.URL.Path)
+		}
+		mu.Lock()
+		calls = append(calls, capturedCall{path: r.URL.Path, body: body})
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	return srv, func() []capturedCall {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]capturedCall(nil), calls...)
+	}
+}
+
+func lastIsUnmute(calls []capturedCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	l := calls[len(calls)-1]
+	return l.path == "/api/services/media_player/volume_mute" && l.body["is_volume_muted"] == false
+}
+
+func TestPlayMedia_UnmutesWhenNeverPlaying(t *testing.T) {
+	// Target never reports playing: after startWait the unmute still happens.
+	srv, calls := muteServer(t, func() string { return `{"state":"idle"}` }, nil)
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	c.startWait = 20 * time.Millisecond
+	if err := c.PlayMedia(context.Background(), "pink", 20); err != nil {
+		t.Fatalf("PlayMedia: %v", err)
+	}
+	if !lastIsUnmute(calls()) {
+		t.Errorf("calls = %v, want trailing unmute", calls())
+	}
+}
+
+func TestPlayMedia_UnmutesOnPlayFailure(t *testing.T) {
+	var mu sync.Mutex
+	var unmuted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = io.WriteString(w, `{"state":"idle"}`)
+		case r.URL.Path == "/api/services/media_player/play_media":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case r.URL.Path == "/api/services/media_player/volume_mute":
+			b := decodeBody(t, r)
+			mu.Lock()
+			unmuted = b["is_volume_muted"] == false
+			mu.Unlock()
+		}
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	if err := c.PlayMedia(context.Background(), "pink", 20); err == nil {
+		t.Fatal("PlayMedia err = nil, want play_media failure")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !unmuted {
+		t.Error("speaker left muted after a failed play")
+	}
+}
+
+func TestPlayMedia_UnmutesWhenCancelledWhileWaiting(t *testing.T) {
+	// OFF (ctx cancel) while waiting for "playing": the unmute must still be
+	// sent even though ctx is cancelled.
+	srv, calls := muteServer(t, func() string { return `{"state":"idle"}` }, nil)
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	c.startWait = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	c.sleep = func(ctx context.Context, d time.Duration) error { cancel(); return ctx.Err() }
+	if err := c.PlayMedia(ctx, "pink", 20); err != nil {
+		t.Fatalf("PlayMedia: %v (play_media itself succeeded)", err)
+	}
+	if !lastIsUnmute(calls()) {
+		t.Errorf("calls = %v, want trailing unmute despite cancel", calls())
+	}
+}
+
+func TestPlayMedia_MuteFailureStillPlays(t *testing.T) {
+	// Mute is best effort: an HA error on volume_mute must not block playback.
+	var mu sync.Mutex
+	var played bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/states/media_player.bedroom":
+			_, _ = io.WriteString(w, `{"state":"playing"}`)
+		case "/api/services/media_player/volume_mute":
+			http.Error(w, "not supported", http.StatusBadRequest)
+		case "/api/services/media_player/play_media":
+			mu.Lock()
+			played = true
+			mu.Unlock()
+		}
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	if err := c.PlayMedia(context.Background(), "pink", 20); err != nil {
+		t.Fatalf("PlayMedia: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !played {
+		t.Error("play_media not sent after mute failed")
+	}
+}
+
+func TestRecoverMute(t *testing.T) {
+	ours := "x-rincon-mp3radio://http://host:8099/stream?preset=pink"
+	cases := []struct {
+		name       string
+		state      string
+		wantUnmute bool
+	}{
+		{"muted on our stream", `{"state":"idle","attributes":{"is_volume_muted":true,"media_content_id":"` + ours + `"}}`, true},
+		{"muted on other media", `{"state":"playing","attributes":{"is_volume_muted":true,"media_content_id":"x-sonos-spotify:abc"}}`, false},
+		{"not muted", `{"state":"idle","attributes":{"is_volume_muted":false,"media_content_id":"` + ours + `"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, calls := muteServer(t, func() string { return tc.state }, nil)
+			defer srv.Close()
+			c := newTestClient(t, srv.URL)
+			if err := c.RecoverMute(context.Background()); err != nil {
+				t.Fatalf("RecoverMute: %v", err)
+			}
+			if got := lastIsUnmute(calls()); got != tc.wantUnmute {
+				t.Errorf("unmuted = %v, want %v (calls %v)", got, tc.wantUnmute, calls())
+			}
+		})
 	}
 }
 
@@ -211,11 +367,13 @@ func TestPlayMedia_BackoffOnUnavailable_ThenAvailable(t *testing.T) {
 	if err := c.PlayMedia(context.Background(), "white", 30); err != nil {
 		t.Fatalf("PlayMedia: %v", err)
 	}
-	if stateCalls != 3 {
-		t.Errorf("state probes = %d, want 3", stateCalls)
+	// 3 availability probes + 1 "started?" probe after play_media.
+	if stateCalls != 4 {
+		t.Errorf("state probes = %d, want 4", stateCalls)
 	}
-	if sleeps != 2 {
-		t.Errorf("backoff sleeps = %d, want 2", sleeps)
+	// 2 availability backoffs + 1 unmute hold once "playing" is seen.
+	if sleeps != 3 {
+		t.Errorf("sleeps = %d, want 3", sleeps)
 	}
 	if !playCalled {
 		t.Error("play_media never issued after recovery")

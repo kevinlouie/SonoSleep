@@ -30,16 +30,17 @@ import (
 	"github.com/kevin/ha-white-noise-sonos/internal/stream"
 )
 
-// Shutdown time budget. The steps run in sequence: reconciler stop (≤5 s — an HA
+// Shutdown time budget. The steps run in sequence: reconciler stop (≤7 s — an HA
 // service call already sent is allowed to finish, bounded by ha's 4 s
-// serviceCallTimeout, so the wait covers it and the reconciler has recorded the
-// result before NeedsFinalStop is read) + media_stop (≤4 s, the service-call
-// bound) + HTTP close (≤2 s) + MQTT offline and disconnect (≤2 s write timeout +
-// 1 s token wait + 0.25 s, see internal/mqtt) ≈ 14.25 s worst case, inside
+// serviceCallTimeout, and a play cancelled mid-start still sends its 2 s-bounded
+// unmute; the wait covers both so the reconciler has recorded the result before
+// NeedsFinalStop is read) + media_stop (≤4 s, the service-call bound) + HTTP
+// close (≤2 s) + MQTT offline and disconnect (≤2 s write timeout + 1 s token
+// wait + 0.25 s, see internal/mqtt) ≈ 16.25 s worst case, inside
 // docker-compose.yml's 20 s stop_grace_period. The common case (no HA call in
 // flight) is well under 10 s.
 const (
-	reconcilerStopTimeout = 5 * time.Second
+	reconcilerStopTimeout = 7 * time.Second
 	mediaStopTimeout      = 5 * time.Second
 	httpShutdownTimeout   = 2 * time.Second
 )
@@ -93,6 +94,15 @@ func main() {
 	// Shut down cleanly on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// A crash between PlayMedia's start-up mute and unmute would leave the Sonos
+	// muted on our stream; undo that before anything else touches the target.
+	// Best effort: HA may not be reachable yet.
+	recoverCtx, cancelRecover := context.WithTimeout(ctx, 5*time.Second)
+	if err := haClient.RecoverMute(recoverCtx); err != nil {
+		slog.Warn("startup: mute recovery check failed", "err", err)
+	}
+	cancelRecover()
 
 	// Reconciler: the only goroutine that issues HA calls for the control state.
 	reconcilerDone := make(chan struct{})

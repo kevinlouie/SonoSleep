@@ -48,12 +48,17 @@ Synology docker host
    switch/preset command abandons an older one's availability backoff — a service call
    already sent to HA is allowed to finish, so HA sees them in order — and failed calls
    are retried with capped backoff).
-2. Go calls HA `media_player.volume_set` to the number entity's value **first**, then
-   `media_player.play_media` on the target with
+2. Go calls HA `media_player.volume_mute` (on), then `media_player.volume_set` to the
+   number entity's value, then `media_player.play_media` on the target with
    `media_content_id = x-rincon-mp3radio://<PUBLIC_BASE_URL>/stream?preset=<current>`,
-   `media_content_type = music` — so the Sonos never starts at its previous volume.
-3. The Sonos opens the stream; the HTTP handler starts a per-connection
-   noise → ffmpeg → MP3 pipeline and streams it indefinitely.
+   `media_content_type = music`. Volume goes before play so the Sonos never starts at its
+   previous volume. The mute hides a short blip the **Sonos itself** makes whenever it
+   starts an `x-rincon-mp3radio` stream (verified with a pure-silence file); Go unmutes
+   about 1 s after HA reports `playing` (or after 15 s, or if the play fails or is
+   cancelled). At startup, a mute left on our stream by a crash mid-start is undone.
+3. The Sonos opens the stream (it makes a short throwaway connection first, then the one
+   it keeps); the HTTP handler starts a per-connection noise → ffmpeg → MP3 pipeline
+   and streams it indefinitely, up to 10 s ahead of real time, then paced.
 4. Watchdog: if the Sonos reports `idle`/`paused` on two consecutive polls, or recovers
    from `unavailable`, while the switch is ON, Go re-issues `play_media`. A 30 s suppress
    window follows every play so a Sonos that is still buffering isn't restarted.
