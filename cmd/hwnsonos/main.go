@@ -60,7 +60,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.Handle("/stream", stream.New(defaultPreset))
+	streamer := stream.New(defaultPreset)
+	streamer.FadeIn = time.Duration(cfg.FadeInSeconds) * time.Second
+	mux.Handle("/stream", streamer)
 
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,

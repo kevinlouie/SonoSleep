@@ -17,7 +17,7 @@ Kellet pink) ports over directly.
 - Orchestrates playback by calling the **HA REST API** (`play_media`, `volume_set`,
   `media_stop`) on the target `media_player` (default `media_player.bedroom`).
 - Runs a **watchdog** that re-arms playback if the Sonos drops the long stream.
-- Eases playback in with a ~3 s **fade-in** gain ramp at stream start.
+- Eases playback in with a **fade-in** (cubic ease-in, 10 s default) at stream start.
 
 ## Architecture
 
@@ -82,6 +82,7 @@ cp .env.example .env
 | `HWN_MQTT_USER` / `HWN_MQTT_PASS` | | Broker credentials (optional). |
 | `HWN_DEFAULT_PRESET` | | `white` \| `pink` \| `brown`. Default `brown`. |
 | `HWN_DEFAULT_VOLUME` | | `0`–`100`. Default `80`. |
+| `HWN_FADE_IN_SECONDS` | | Fade-in length at stream start, `0`–`120` (`0` disables). Default `10`. |
 | `HWN_LOG_LEVEL` | | `debug` \| `info` \| `warn` \| `error`. Default `info`. Structured (`log/slog`) to stderr. |
 
 The full list also lives in [`.env.example`](.env.example).

@@ -80,3 +80,26 @@ func TestLoadInvalidPresetAndVolume(t *testing.T) {
 		t.Errorf("error %q missing volume complaint", err)
 	}
 }
+
+func TestLoadFadeIn(t *testing.T) {
+	setRequired(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.FadeInSeconds != 10 {
+		t.Errorf("default FadeInSeconds = %d, want 10", c.FadeInSeconds)
+	}
+
+	t.Setenv("HWN_FADE_IN_SECONDS", "0")
+	if c, err = Load(); err != nil || c.FadeInSeconds != 0 {
+		t.Errorf("HWN_FADE_IN_SECONDS=0: got %v, %v; want 0, nil", c, err)
+	}
+
+	for _, bad := range []string{"-1", "121", "ten"} {
+		t.Setenv("HWN_FADE_IN_SECONDS", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "HWN_FADE_IN_SECONDS") {
+			t.Errorf("HWN_FADE_IN_SECONDS=%q: err = %v, want complaint", bad, err)
+		}
+	}
+}

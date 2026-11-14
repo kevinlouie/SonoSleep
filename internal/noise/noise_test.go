@@ -157,8 +157,8 @@ func TestNew_NoFade(t *testing.T) {
 	}
 }
 
-// TestNewWithFade_Envelope checks the ramp: gain starts at 0, rises linearly,
-// and reaches/stays at 1.0 after the configured duration.
+// TestNewWithFade_Envelope checks the ramp: gain starts at 0, follows the cubic
+// ease-in curve, and reaches/stays at 1.0 after the configured duration.
 func TestNewWithFade_Envelope(t *testing.T) {
 	const fade = 100 * time.Millisecond
 	g := NewWithFade(White, fade)
@@ -171,14 +171,14 @@ func TestNewWithFade_Envelope(t *testing.T) {
 	if got := g.fadeGain(); got != 0.0 {
 		t.Errorf("frame 0 gain = %v, want 0.0", got)
 	}
-	// Midpoint: ~0.5 (consume up to the middle).
+	// Midpoint: 0.5³ = 0.125 (consume up to the middle).
 	half := wantFrames / 2
 	for i := uint64(1); i < half; i++ {
 		g.fadeGain()
 	}
 	mid := g.fadeGain()
-	if mid < 0.45 || mid > 0.55 {
-		t.Errorf("midpoint gain = %v, want ≈ 0.5", mid)
+	if mid < 0.12 || mid > 0.13 {
+		t.Errorf("midpoint gain = %v, want ≈ 0.125 (cubic ease-in)", mid)
 	}
 	// Past the end: clamped at 1.0.
 	for i := half + 1; i <= wantFrames+10; i++ {

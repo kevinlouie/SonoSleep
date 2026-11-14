@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kevin/ha-white-noise-sonos/internal/noise"
 )
@@ -43,6 +44,9 @@ type Streamer struct {
 	Bitrate string
 	// DefaultPreset is used when the request omits ?preset.
 	DefaultPreset noise.Preset
+	// FadeIn is the gain ramp applied at the start of each connection
+	// (default noise.FadeInDuration). Zero disables it.
+	FadeIn time.Duration
 
 	// encoderCmd builds the encoder process. Overridable in tests to inject a
 	// fake (e.g. `cat`) so teardown can be exercised without real ffmpeg.
@@ -60,6 +64,7 @@ func New(defaultPreset noise.Preset) *Streamer {
 		FFmpegPath:    "ffmpeg",
 		Bitrate:       defaultBitrate,
 		DefaultPreset: defaultPreset,
+		FadeIn:        noise.FadeInDuration,
 	}
 	s.encoderCmd = s.ffmpegCmd
 	return s
@@ -134,7 +139,7 @@ func (s *Streamer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Feed synthesized PCM into the encoder until the client disconnects or the
 	// encoder dies.
-	go feed(ctx, stdin, preset)
+	go feed(ctx, stdin, preset, s.FadeIn)
 
 	// Radio-stream headers. NO Content-Length → Go uses chunked encoding, which
 	// makes Sonos treat this as an endless stream, not a finite track.
@@ -175,11 +180,11 @@ func stationName(p noise.Preset) string {
 // write fails (ffmpeg exited on its own). The two exit paths are independent:
 // the ctx check covers idle cancellation, the write error covers ffmpeg dying
 // while the client is still connected.
-func feed(ctx context.Context, w io.WriteCloser, p noise.Preset) {
+func feed(ctx context.Context, w io.WriteCloser, p noise.Preset, fade time.Duration) {
 	defer func() { _ = w.Close() }()
-	// Ease playback in with a short gain ramp (matches reSpeakerSleep) so the
-	// Sonos doesn't start at full level.
-	g := noise.NewWithFade(p, noise.FadeInDuration)
+	// Ease playback in with a gain ramp so the Sonos doesn't snap from silence
+	// to full level once its start-up buffering finishes.
+	g := noise.NewWithFade(p, fade)
 	buf := make([]byte, blockFrames*noise.BytesPerFrame)
 	for {
 		select {
