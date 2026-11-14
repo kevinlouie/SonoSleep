@@ -77,10 +77,10 @@ const (
 	brownCoef = 0.015 // one-pole a → fc = a*fs/2π ≈ 115 Hz
 )
 
-// FadeInDuration is the default ramp length used by NewWithFade — matches the
-// ~3 s gain ramp reSpeakerSleep applied at start so playback eases in rather than
-// beginning at full level.
-const FadeInDuration = 3 * time.Second
+// FadeInDuration is the default fade-in ramp length at stream start. Long enough
+// that the Sonos (which buffers a few seconds before it starts playing) eases in
+// gently instead of snapping from silence to full level.
+const FadeInDuration = 10 * time.Second
 
 // Generator produces an endless stream of one preset. It is NOT safe for
 // concurrent use; create one per stream connection. To change preset mid-stream
@@ -93,7 +93,7 @@ type Generator struct {
 
 	// Fade-in envelope. fadeFrames is the total ramp length in frames (0 disables
 	// the fade); fadePos counts frames emitted so far, capped at fadeFrames. Gain
-	// ramps linearly 0→1 over the first fadeFrames frames, then stays 1.
+	// follows a cubic ease-in 0→1 over the first fadeFrames frames, then stays 1.
 	fadeFrames uint64
 	fadePos    uint64
 }
@@ -104,8 +104,8 @@ func New(p Preset) *Generator {
 	return &Generator{preset: p, rng: 0x9E3779B9}
 }
 
-// NewWithFade is like New but applies a linear gain ramp from 0 to full over the
-// first `fade` of audio (clamped to >= 0). It eases playback in so the stream
+// NewWithFade is like New but applies a cubic ease-in gain ramp from 0 to full
+// over the first `fade` of audio (clamped to >= 0). It eases playback in so the stream
 // does not begin abruptly at full level. A zero or negative fade disables the
 // ramp (equivalent to New).
 func NewWithFade(p Preset, fade time.Duration) *Generator {
@@ -118,13 +118,18 @@ func NewWithFade(p Preset, fade time.Duration) *Generator {
 
 // fadeGain returns the envelope gain in [0,1] for the current fade position and
 // advances it by one frame. Without a configured fade it always returns 1.
+//
+// The curve is cubic (t³), not linear: perceived loudness tracks dB, and a
+// linear amplitude ramp is already at -6 dB halfway through, so it sounds like
+// it switches on almost immediately. t³ is -18 dB at the midpoint and rises
+// roughly evenly in perceived loudness to full level.
 func (g *Generator) fadeGain() float64 {
 	if g.fadeFrames == 0 || g.fadePos >= g.fadeFrames {
 		return 1.0
 	}
-	gain := float64(g.fadePos) / float64(g.fadeFrames)
+	t := float64(g.fadePos) / float64(g.fadeFrames)
 	g.fadePos++
-	return gain
+	return t * t * t
 }
 
 // white returns the next raw white sample, uniform in [-1, 1). xorshift32 RNG —

@@ -22,6 +22,7 @@ type Config struct {
 	MQTTPass      string // HWN_MQTT_PASS (optional)
 	DefaultPreset string // HWN_DEFAULT_PRESET, one of white|pink|brown
 	DefaultVolume int    // HWN_DEFAULT_VOLUME, 0-100
+	FadeInSeconds int    // HWN_FADE_IN_SECONDS, 0-120 (0 disables), default 10
 	LogLevel      string // HWN_LOG_LEVEL, one of debug|info|warn|error (default info)
 }
 
@@ -42,6 +43,7 @@ func Load() (*Config, error) {
 		MQTTPass:      os.Getenv("HWN_MQTT_PASS"),
 		DefaultPreset: getEnv("HWN_DEFAULT_PRESET", "brown"),
 		DefaultVolume: 80,
+		FadeInSeconds: 10,
 		LogLevel:      getEnv("HWN_LOG_LEVEL", "info"),
 	}
 
@@ -73,6 +75,18 @@ func Load() (*Config, error) {
 			problems = append(problems, fmt.Sprintf("HWN_DEFAULT_VOLUME %d must be 0-100", n))
 		default:
 			c.DefaultVolume = n
+		}
+	}
+
+	if v := os.Getenv("HWN_FADE_IN_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("HWN_FADE_IN_SECONDS %q must be an integer", v))
+		case n < 0 || n > 120:
+			problems = append(problems, fmt.Sprintf("HWN_FADE_IN_SECONDS %d must be 0-120", n))
+		default:
+			c.FadeInSeconds = n
 		}
 	}
 
