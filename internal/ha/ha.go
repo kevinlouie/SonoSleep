@@ -1,7 +1,8 @@
 // Package ha is a small Home Assistant REST client that orchestrates playback on
 // the target Sonos media_player. It exposes the handful of service calls the rest
-// of the service needs — PlayMedia, VolumeSet, MediaStop — plus GetState for the
-// watchdog (internal/ha/watchdog.go).
+// of the service needs — PlayMedia (volume_set, then play_media), VolumeSet,
+// MediaStop — plus GetState for the watchdog (internal/ha/watchdog.go) and the
+// controller's "already playing?" check.
 //
 // Authentication is a long-lived access token sent as a Bearer header
 // (config HWN_HA_TOKEN). The base URL and target entity also come from config.
@@ -38,10 +39,21 @@ const (
 	StatePlaying     = "playing"
 )
 
+// serviceCallTimeout bounds one service-call POST once it has been sent. Such a
+// call ignores caller cancellation (see callService), so this is what keeps it
+// finite; shutdown's reconciler wait in cmd/hwnsonos is sized to cover it.
+const serviceCallTimeout = 4 * time.Second
+
 // ErrUnavailable is returned (wrapped) when the target media_player reports the
 // "unavailable" state — typically the Sonos is powered off. Callers should
 // surface this rather than spin: see PlayMedia's backoff and the watchdog.
 var ErrUnavailable = errors.New("ha: target media_player is unavailable")
+
+// ErrOutcomeUnknown is returned (wrapped) when a service call was handed to the
+// HTTP transport but no response arrived (timeout, connection failure): HA may
+// or may not have executed it. A refusal to send (ctx already cancelled) or an
+// HA error status is a definite failure and does not wrap this.
+var ErrOutcomeUnknown = errors.New("ha: service call outcome unknown")
 
 // Client talks to the Home Assistant REST API for one target media_player entity.
 // It is safe for concurrent use (http.Client is, and Client holds no mutable
@@ -63,6 +75,8 @@ type Client struct {
 	jitter func() float64
 	// sleep blocks for d or until ctx is done. Injectable for fast tests.
 	sleep func(ctx context.Context, d time.Duration) error
+	// callTimeout bounds a sent service call (default serviceCallTimeout).
+	callTimeout time.Duration
 }
 
 // New returns a Client for the given HA base URL, token, target entity, and the
@@ -70,16 +84,17 @@ type Client struct {
 // any trailing slash trimmed.
 func New(baseURL, token, entityID, publicBase string) *Client {
 	c := &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		token:      token,
-		entityID:   entityID,
-		publicBase: strings.TrimRight(publicBase, "/"),
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		maxRetries: 5,
-		baseDelay:  500 * time.Millisecond,
-		maxDelay:   30 * time.Second,
-		jitter:     defaultJitter,
-		sleep:      sleepCtx,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		token:       token,
+		entityID:    entityID,
+		publicBase:  strings.TrimRight(publicBase, "/"),
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		maxRetries:  5,
+		baseDelay:   500 * time.Millisecond,
+		maxDelay:    30 * time.Second,
+		jitter:      defaultJitter,
+		sleep:       sleepCtx,
+		callTimeout: serviceCallTimeout,
 	}
 	return c
 }
@@ -96,13 +111,28 @@ func (c *Client) MediaContentID(preset string) string {
 	return rincon + c.publicBase + "/stream?preset=" + preset
 }
 
-// PlayMedia starts playback of the noise stream for preset, then sets the Sonos
-// volume. It first probes GetState: if the target is unavailable it retries with
+// PlayMedia sets the Sonos volume, then starts playback of the noise stream for
+// preset. It first probes GetState: if the target is unavailable it retries with
 // capped exponential backoff + jitter; if still unavailable after maxRetries it
 // returns ErrUnavailable (wrapped) so the caller can surface the state instead of
 // spinning forever. volume is 0-100 and is converted to HA's 0.0-1.0 scale.
+//
+// Cancelling ctx abandons the availability backoff and skips any call not yet
+// sent; a call already sent completes (see callService).
+//
+// Order matters: volume_set goes BEFORE play_media. The other way round the
+// Sonos starts audibly at its previous volume for a fraction of a second before
+// ducking to the target. There is deliberately no second volume_set after play.
 func (c *Client) PlayMedia(ctx context.Context, preset string, volume int) error {
 	if err := c.waitAvailable(ctx); err != nil {
+		return err
+	}
+	if err := c.VolumeSet(ctx, volume); err != nil {
+		// play_media was never sent, so whatever happened to volume_set the
+		// play's outcome is known: drop ErrOutcomeUnknown from the chain (%v).
+		if errors.Is(err, ErrOutcomeUnknown) {
+			return fmt.Errorf("ha: play not sent: %v", err)
+		}
 		return err
 	}
 
@@ -113,9 +143,6 @@ func (c *Client) PlayMedia(ctx context.Context, preset string, volume int) error
 	}
 	if err := c.callService(ctx, "media_player", "play_media", body); err != nil {
 		return fmt.Errorf("ha: play_media: %w", err)
-	}
-	if err := c.VolumeSet(ctx, volume); err != nil {
-		return err
 	}
 	return nil
 }
@@ -181,7 +208,23 @@ func (c *Client) GetState(ctx context.Context) (string, error) {
 }
 
 // callService POSTs a JSON body to /api/services/<domain>/<service>.
+//
+// A cancelled ctx stops a call from being sent, but once the POST is on the wire
+// it ignores cancellation and runs until it completes or hits its own timeout:
+// callTimeout, or the caller's deadline if sooner. HA may execute a service call
+// even if the client hangs up, so abandoning it would let e.g. a stale
+// play_media land after the media_stop that superseded it. Callers serialize
+// ops, so waiting for the response keeps HA's order equal to ours.
 func (c *Client) callService(ctx context.Context, domain, service string, body any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := c.callTimeout
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < timeout {
+		timeout = time.Until(dl)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -196,7 +239,7 @@ func (c *Client) callService(ctx context.Context, domain, service string, body a
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 

@@ -17,7 +17,7 @@ Kellet pink) ports over directly.
 - Orchestrates playback by calling the **HA REST API** (`play_media`, `volume_set`,
   `media_stop`) on the target `media_player` (default `media_player.bedroom`).
 - Runs a **watchdog** that re-arms playback if the Sonos drops the long stream.
-- Eases playback in with a **fade-in** (cubic ease-in, 10 s default) at stream start.
+- Eases playback in with a **fade-in** (cubic ease-in, 3 s default) at stream start.
 
 ## Architecture
 
@@ -31,7 +31,8 @@ Synology docker host
  │     │
  └─ ha-white-noise-sonos (Go) ─────────────────┘
         ├─ MQTT client  : publish discovery, subscribe commands, publish state
-        ├─ Orchestrator : on switch/preset/volume → call HA REST; watchdog re-play
+        ├─ Orchestrator : record switch/preset/volume intent; one reconciler
+        │                 goroutine applies the latest intent via HA REST
         ├─ HTTP stream  : GET /stream?preset=brown → infinite chunked MP3
         │     noise_gen (PCM s16le) ─pipe─> ffmpeg (-f mp3 -) ─> chunked body
         └─ noise_gen    : white / pink / brown synthesis
@@ -41,15 +42,21 @@ Synology docker host
 
 ### Playback flow
 
-1. User flips the **White Noise** switch ON in HA → MQTT command → Go service.
-2. Go calls HA `media_player.play_media` on the target with
+1. User flips the **White Noise** switch ON in HA → MQTT command → Go service. The
+   command handler only records the new intent and publishes it back to HA; a single
+   reconciler goroutine performs every HA call, always for the latest intent (a newer
+   switch/preset command abandons an older one's availability backoff — a service call
+   already sent to HA is allowed to finish, so HA sees them in order — and failed calls
+   are retried with capped backoff).
+2. Go calls HA `media_player.volume_set` to the number entity's value **first**, then
+   `media_player.play_media` on the target with
    `media_content_id = x-rincon-mp3radio://<PUBLIC_BASE_URL>/stream?preset=<current>`,
-   `media_content_type = music`, then `media_player.volume_set` to the number entity's value.
+   `media_content_type = music` — so the Sonos never starts at its previous volume.
 3. The Sonos opens the stream; the HTTP handler starts a per-connection
    noise → ffmpeg → MP3 pipeline and streams it indefinitely.
-4. Watchdog: if the Sonos reports `idle`/`paused`, or recovers from `unavailable`, while
-   the switch is ON, Go re-issues `play_media` (with a suppress window after a deliberate
-   stop so it never fights an intended pause/announcement).
+4. Watchdog: if the Sonos reports `idle`/`paused` on two consecutive polls, or recovers
+   from `unavailable`, while the switch is ON, Go re-issues `play_media`. A 30 s suppress
+   window follows every play so a Sonos that is still buffering isn't restarted.
 5. Switch OFF → Go calls `media_player.media_stop`; the stream connection closes.
 
 ## Requirements
@@ -82,7 +89,7 @@ cp .env.example .env
 | `HWN_MQTT_USER` / `HWN_MQTT_PASS` | | Broker credentials (optional). |
 | `HWN_DEFAULT_PRESET` | | `white` \| `pink` \| `brown`. Default `brown`. |
 | `HWN_DEFAULT_VOLUME` | | `0`–`100`. Default `80`. |
-| `HWN_FADE_IN_SECONDS` | | Fade-in length at stream start, `0`–`120` (`0` disables). Default `10`. |
+| `HWN_FADE_IN_SECONDS` | | Fade-in length at stream start, `0`–`120` (`0` disables). Default `3`. |
 | `HWN_LOG_LEVEL` | | `debug` \| `info` \| `warn` \| `error`. Default `info`. Structured (`log/slog`) to stderr. |
 
 The full list also lives in [`.env.example`](.env.example).
@@ -137,7 +144,7 @@ Once the service connects to MQTT, a device **White Noise (Sonos)** appears unde
 
 | Entity | Type | Effect |
 |---|---|---|
-| **White Noise** | switch | ON → play the stream + set volume; OFF → `media_stop`. |
+| **White Noise** | switch | ON → set volume + play the stream; OFF → `media_stop`. |
 | **White Noise Preset** | select (`white`/`pink`/`brown`) | Changes the noise colour; re-plays with the new preset URL if currently ON. |
 | **White Noise Volume** | number (0–100 %) | Sets the **Sonos** volume via `volume_set`. |
 
@@ -159,9 +166,10 @@ State/command topics live under the `hwnsonos/` namespace (e.g. `hwnsonos/power/
 4. Flip the **White Noise** switch in HA. If the Sonos is powered off it reports
    `unavailable`; the service backs off and re-plays automatically once it comes back.
 
-The service shuts down gracefully on `SIGINT`/`SIGTERM` (Docker stop): it drains the HTTP
-server, publishes MQTT `offline`, issues `media_stop` if it was playing, and disconnects
-from the broker — all within a bounded timeout.
+The service shuts down gracefully on `SIGINT`/`SIGTERM` (Docker stop): it issues
+`media_stop` if it was playing, closes the stream connections and HTTP server, publishes
+MQTT `offline`, and disconnects from the broker — normally within a few seconds, and
+time-boxed to ~14 s worst case (the compose file sets `stop_grace_period: 20s`).
 
 ## Troubleshooting
 
@@ -183,18 +191,20 @@ with **no** `Content-Length` (chunked).
 ### Stream drops after a while / playback stops on its own
 
 Sonos can drop very long HTTP streams. The **watchdog** polls the `media_player` state
-(every ~10 s) and re-issues `play_media` when it sees `idle`/`paused` while the switch is
-ON. A brief ~1–2 s re-buffer gap is expected and acceptable. Look for
-`watchdog: target stopped while ON, re-issuing play` in the logs. If it re-plays too
-aggressively during a deliberate pause or a TTS/alarm announcement, note that a 15 s
-suppress window already follows any deliberate stop.
+(every ~10 s) and re-issues `play_media` when it sees `idle`/`paused` on two consecutive
+polls while the switch is ON (so a pause while ON is re-played after ~20 s — intended for
+a sleep-noise device). A brief ~1–2 s re-buffer gap is expected and acceptable. Look for
+`watchdog: target stopped while ON, requesting play` in the logs. A 30 s suppress window
+follows every play so the Sonos buffering right after `play_media` isn't mistaken for a
+drop.
 
 ### Speaker shows `unavailable`
 
 The Sonos is powered off or off the network. `play_media` probes the state first and backs
 off with **capped exponential backoff + jitter** rather than spinning, logging
-`ha: target unavailable, backing off`. Power the speaker on; the watchdog detects the
-recovery edge and re-plays automatically. (The bedroom Sonos is often powered down between
+`ha: target unavailable, backing off`, and keeps retrying (capped at one attempt a minute,
+`control: HA operation failed, will retry`) while the switch stays ON. Power the speaker
+on; the watchdog detects the recovery edge and re-plays straight away. (The bedroom Sonos is often powered down between
 sleeps — this is expected.)
 
 ### `ffmpeg` missing / `encoder start failed`
@@ -211,8 +221,10 @@ in the logs mean ffmpeg isn't found or errored — verify with `ffmpeg -version`
   `mqtt: connection lost, will reconnect with backoff` and `mqtt: connected`.
 - If the device never shows up in HA, confirm the **MQTT integration** is added in HA and
   pointed at the **same broker**, and that discovery is enabled (prefix `homeassistant`).
-- On (re)connect the service re-publishes discovery + re-asserts state, so a restarted
-  broker recovers without intervention.
+- On (re)connect the service re-publishes discovery + state, so a restarted broker
+  recovers without intervention. If the switch is ON and the Sonos isn't playing it
+  re-plays; it never stops the speaker on connect (with the switch OFF it leaves whatever
+  is playing alone).
 
 ## Project layout
 
@@ -225,7 +237,7 @@ in the logs mean ffmpeg isn't found or errored — verify with `ffmpeg -version`
 | `internal/stream` | `/stream` handler: PCM → ffmpeg → chunked MP3 per connection. |
 | `internal/ha` | HA REST client (`play_media`/`volume_set`/`media_stop`/`get_state`) + watchdog. |
 | `internal/mqtt` | MQTT-discovery entities + command/state handling. |
-| `internal/control` | authoritative `{on, preset, volume}` state (single source of truth). |
+| `internal/control` | authoritative `{on, preset, volume}` state (single source of truth) + the reconciler goroutine that applies it to HA. |
 
 Design rationale lives in [`projectplan.md`](projectplan.md); task breakdown and specs are
 under [`.ralph/`](.ralph/) (this repo is developed with the Ralph autonomous loop).

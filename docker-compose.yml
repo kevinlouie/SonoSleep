@@ -9,6 +9,9 @@ services:
     image: ghcr.io/kevinlouie/ha-white-noise-sonos:latest
     container_name: hwnsonos
     restart: unless-stopped
+    # Graceful shutdown (media_stop, close streams, MQTT offline) is time-boxed
+    # at ~14 s worst case (see cmd/hwnsonos); Docker's 10 s default is too short.
+    stop_grace_period: 20s
     network_mode: host
     env_file:
       - .env

@@ -13,6 +13,15 @@ import (
 // publishTimeout bounds how long a single publish waits for the broker token.
 const publishTimeout = 10 * time.Second
 
+// offlineTimeout bounds the "offline" publish on shutdown, so a dead broker
+// can't eat the container's stop grace period.
+const offlineTimeout = time.Second
+
+// writeTimeout bounds how long paho blocks handing a publish to its network
+// writer. paho's default (0) waits up to 30 s inside Publish itself, before any
+// token exists to time out on.
+const writeTimeout = 2 * time.Second
+
 // pahoBroker adapts paho.mqtt.golang to the Broker interface.
 type pahoBroker struct {
 	client pahomqtt.Client
@@ -27,7 +36,8 @@ func (b *pahoBroker) Publish(topic string, payload []byte, retained bool) error 
 	return tok.Error()
 }
 
-// Subscribe implements Broker. paho delivers messages on its own goroutines.
+// Subscribe implements Broker. paho's ordered router calls handler synchronously,
+// so handler must not block (Service's handlers only record intent).
 func (b *pahoBroker) Subscribe(topic string, handler func(payload []byte)) error {
 	tok := b.client.Subscribe(topic, 1, func(_ pahomqtt.Client, m pahomqtt.Message) {
 		handler(m.Payload())
@@ -38,15 +48,9 @@ func (b *pahoBroker) Subscribe(topic string, handler func(payload []byte)) error
 	return tok.Error()
 }
 
-// Connect dials the broker, builds the Service, and wires the on-connect handler
-// so discovery/availability/state are (re)published and the control state is
-// re-asserted on every connect AND reconnect. The LWT is set to publish "offline"
-// (retained) to the availability topic if the connection drops ungracefully.
-//
-// ctx is used for the control reassert calls inside OnConnect (cancel it on
-// shutdown so a reconcile in flight unwinds). It returns the live Service and a
-// disconnect func for graceful shutdown (publish offline, then disconnect).
-func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*Service, func(), error) {
+// clientOptions builds the paho options: reconnect policy, LWT, write timeout
+// and credentials. Split out of Connect so it is unit-testable.
+func clientOptions(broker, user, pass string) *pahomqtt.ClientOptions {
 	// Reconnect policy: paho's auto-reconnect uses capped exponential backoff
 	// between MaxReconnectInterval bounds; the initial connect retry is jittered
 	// (5s ± up to 5s) so a fleet of clients doesn't reconnect in lockstep after a
@@ -60,6 +64,7 @@ func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*
 		SetMaxReconnectInterval(2*time.Minute).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(retryInterval).
+		SetWriteTimeout(writeTimeout).
 		SetWill(AvailabilityTopic, payloadOffline, 1, true)
 	if user != "" {
 		opts.SetUsername(user)
@@ -67,16 +72,31 @@ func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*
 	if pass != "" {
 		opts.SetPassword(pass)
 	}
+	return opts
+}
+
+// Connect dials the broker, builds the Service, and wires the on-connect handler
+// so discovery/availability/state are (re)published and the control state is
+// re-asserted on every connect AND reconnect. The LWT is set to publish "offline"
+// (retained) to the availability topic if the connection drops ungracefully.
+//
+// ctx bounds the Service's state publisher goroutine (Run). It returns the live
+// Service and a disconnect func for graceful shutdown (publish offline, then
+// disconnect).
+func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*Service, func(), error) {
+	opts := clientOptions(broker, user, pass)
 
 	pb := &pahoBroker{}
 	svc := NewService(pb, ctrl)
+	go svc.Run(ctx)
 
-	// On every (re)connect: re-subscribe and run the reconcile sequence.
+	// On every (re)connect: re-subscribe and run the reconcile sequence. paho
+	// runs this handler on its own goroutine, so the publish waits are fine here.
 	opts.SetOnConnectHandler(func(_ pahomqtt.Client) {
-		if err := svc.Subscribe(ctx); err != nil {
+		if err := svc.Subscribe(); err != nil {
 			slog.Error("mqtt: subscribe on connect failed", "err", err)
 		}
-		if err := svc.OnConnect(ctx); err != nil {
+		if err := svc.OnConnect(); err != nil {
 			slog.Error("mqtt: on-connect publish failed", "err", err)
 		}
 		slog.Info("mqtt: connected (discovery + state published)", "broker", broker)
@@ -98,8 +118,11 @@ func Connect(ctx context.Context, broker, user, pass string, ctrl Controller) (*
 
 	disconnect := func() {
 		// Publish offline explicitly (retained) before a clean disconnect; the
-		// LWT only fires on ungraceful drops.
-		if err := svc.PublishOffline(); err != nil {
+		// LWT only fires on ungraceful drops. Short wait: shutdown is time-boxed.
+		tok := client.Publish(AvailabilityTopic, 1, true, []byte(payloadOffline))
+		if !tok.WaitTimeout(offlineTimeout) {
+			slog.Warn("mqtt: publish offline on shutdown timed out")
+		} else if err := tok.Error(); err != nil {
 			slog.Warn("mqtt: publish offline on shutdown failed", "err", err)
 		}
 		client.Disconnect(250)
