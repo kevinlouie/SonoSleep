@@ -39,6 +39,26 @@ const (
 	StatePlaying     = "playing"
 )
 
+// Start-up mute timing (see PlayMedia). The Sonos emits a short blip when it
+// starts any x-rincon-mp3radio stream — verified on device with a pure-silence
+// file: the blip came with the radio wrapper and not with a plain file — so the
+// target is muted until playback has started.
+const (
+	// defaultStartWait bounds how long PlayMedia waits for "playing" before
+	// unmuting anyway (a stuck mute is worse than a blip).
+	defaultStartWait = 15 * time.Second
+	// defaultStartPoll is the GetState poll interval while waiting.
+	defaultStartPoll = 100 * time.Millisecond
+	// defaultUnmuteDelay is how long after "playing" the mute is held: the blip
+	// can land just after the state flips, and the stream's fade-in is still
+	// near-silent this early, so nothing audible is lost. Overridable with
+	// SetUnmuteDelay (config HWN_UNMUTE_DELAY_MS).
+	defaultUnmuteDelay = 300 * time.Millisecond
+	// unmuteTimeout bounds the (detached) unmute call, so a cancelled play
+	// costs at most play POST + unmute within shutdown's reconciler wait.
+	unmuteTimeout = 2 * time.Second
+)
+
 // serviceCallTimeout bounds one service-call POST once it has been sent. Such a
 // call ignores caller cancellation (see callService), so this is what keeps it
 // finite; shutdown's reconciler wait in cmd/hwnsonos is sized to cover it.
@@ -77,6 +97,10 @@ type Client struct {
 	sleep func(ctx context.Context, d time.Duration) error
 	// callTimeout bounds a sent service call (default serviceCallTimeout).
 	callTimeout time.Duration
+	// Start-up mute timing (defaults above); fields so tests can shrink them.
+	startWait   time.Duration
+	startPoll   time.Duration
+	unmuteDelay time.Duration
 }
 
 // New returns a Client for the given HA base URL, token, target entity, and the
@@ -95,8 +119,20 @@ func New(baseURL, token, entityID, publicBase string) *Client {
 		jitter:      defaultJitter,
 		sleep:       sleepCtx,
 		callTimeout: serviceCallTimeout,
+		startWait:   defaultStartWait,
+		startPoll:   defaultStartPoll,
+		unmuteDelay: defaultUnmuteDelay,
 	}
 	return c
+}
+
+// SetUnmuteDelay sets how long the start-up mute is held after the target
+// reports playing (negative is treated as 0). Call before use.
+func (c *Client) SetUnmuteDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	c.unmuteDelay = d
 }
 
 // EntityID returns the target media_player entity id.
@@ -123,10 +159,24 @@ func (c *Client) MediaContentID(preset string) string {
 // Order matters: volume_set goes BEFORE play_media. The other way round the
 // Sonos starts audibly at its previous volume for a fraction of a second before
 // ducking to the target. There is deliberately no second volume_set after play.
+//
+// Start-up blip: the Sonos itself emits a short blip whenever it starts an
+// x-rincon-mp3radio stream, whatever the audio. So the target is muted before
+// play_media and unmuted once HA reports "playing" (+ unmuteDelay), or after
+// startWait, or on any failure/cancellation — the unmute is deferred and runs
+// on a detached context so it is never skipped once a mute may have landed.
+// Mute is best effort: if it fails, playback goes ahead (blip possible).
 func (c *Client) PlayMedia(ctx context.Context, preset string, volume int) error {
 	if err := c.waitAvailable(ctx); err != nil {
 		return err
 	}
+	if err := c.VolumeMute(ctx, true); err != nil {
+		if ctx.Err() != nil && !errors.Is(err, ErrOutcomeUnknown) {
+			return err // cancelled before anything was sent
+		}
+		slog.Warn("ha: mute before play failed, start-up blip possible", "entity", c.entityID, "err", err)
+	}
+	defer c.unmute(ctx)
 	if err := c.VolumeSet(ctx, volume); err != nil {
 		// play_media was never sent, so whatever happened to volume_set the
 		// play's outcome is known: drop ErrOutcomeUnknown from the chain (%v).
@@ -144,7 +194,68 @@ func (c *Client) PlayMedia(ctx context.Context, preset string, volume int) error
 	if err := c.callService(ctx, "media_player", "play_media", body); err != nil {
 		return fmt.Errorf("ha: play_media: %w", err)
 	}
+	c.waitStarted(ctx)
 	return nil
+}
+
+// waitStarted polls until the target reports "playing", then holds for
+// unmuteDelay. It gives up after startWait or when ctx is cancelled; either way
+// the caller's deferred unmute follows.
+func (c *Client) waitStarted(ctx context.Context) {
+	deadline := time.Now().Add(c.startWait)
+	for {
+		state, err := c.GetState(ctx)
+		if err == nil && state == StatePlaying {
+			_ = c.sleep(ctx, c.unmuteDelay)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			slog.Warn("ha: target not playing after play_media, unmuting anyway",
+				"entity", c.entityID, "state", state, "waited", c.startWait)
+			return
+		}
+		if c.sleep(ctx, c.startPoll) != nil {
+			return
+		}
+	}
+}
+
+// VolumeMute mutes or unmutes the target.
+func (c *Client) VolumeMute(ctx context.Context, muted bool) error {
+	body := map[string]any{"entity_id": c.entityID, "is_volume_muted": muted}
+	if err := c.callService(ctx, "media_player", "volume_mute", body); err != nil {
+		return fmt.Errorf("ha: volume_mute: %w", err)
+	}
+	return nil
+}
+
+// unmute clears the start-up mute on a context detached from ctx's
+// cancellation, so a cancelled or failed play never leaves the speaker muted.
+func (c *Client) unmute(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unmuteTimeout)
+	defer cancel()
+	if err := c.VolumeMute(ctx, false); err != nil {
+		slog.Error("ha: unmute after play failed, target may still be muted", "entity", c.entityID, "err", err)
+	}
+}
+
+// RecoverMute undoes a start-up mute left behind by a crash between mute and
+// unmute: if the target is muted AND its current media is this service's
+// stream, it is unmuted. A mute on anything else is the user's and is left
+// alone. Call once at startup.
+func (c *Client) RecoverMute(ctx context.Context) error {
+	st, err := c.getEntity(ctx)
+	if err != nil {
+		return err
+	}
+	if !st.Attributes.Muted || !strings.HasPrefix(st.Attributes.MediaContentID, rincon+c.publicBase+"/stream") {
+		return nil
+	}
+	slog.Warn("ha: target left muted on our stream (crash mid-start?), unmuting", "entity", c.entityID)
+	return c.VolumeMute(ctx, false)
 }
 
 // VolumeSet sets the target's volume. level is 0-100 and is mapped to HA's
@@ -177,34 +288,49 @@ func (c *Client) MediaStop(ctx context.Context) error {
 // GetState returns the current state string of the target media_player (e.g.
 // "playing", "idle", "paused", "unavailable") via GET /api/states/<entity_id>.
 func (c *Client) GetState(ctx context.Context) (string, error) {
+	st, err := c.getEntity(ctx)
+	if err != nil {
+		return "", err
+	}
+	return st.State, nil
+}
+
+// entityState is the part of GET /api/states/<entity_id> this client reads.
+type entityState struct {
+	State      string `json:"state"`
+	Attributes struct {
+		Muted          bool   `json:"is_volume_muted"`
+		MediaContentID string `json:"media_content_id"`
+	} `json:"attributes"`
+}
+
+// getEntity fetches the target's current state object.
+func (c *Client) getEntity(ctx context.Context) (entityState, error) {
+	var st entityState
 	url := c.baseURL + "/api/states/" + c.entityID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("ha: build get_state request: %w", err)
+		return st, fmt.Errorf("ha: build get_state request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("ha: get_state: %w", err)
+		return st, fmt.Errorf("ha: get_state: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("ha: get_state read body: %w", err)
+		return st, fmt.Errorf("ha: get_state read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ha: get_state status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-
-	var st struct {
-		State string `json:"state"`
+		return st, fmt.Errorf("ha: get_state status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if err := json.Unmarshal(data, &st); err != nil {
-		return "", fmt.Errorf("ha: get_state decode: %w", err)
+		return st, fmt.Errorf("ha: get_state decode: %w", err)
 	}
-	return st.State, nil
+	return st, nil
 }
 
 // callService POSTs a JSON body to /api/services/<domain>/<service>.

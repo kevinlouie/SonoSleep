@@ -48,12 +48,17 @@ Synology docker host
    switch/preset command abandons an older one's availability backoff — a service call
    already sent to HA is allowed to finish, so HA sees them in order — and failed calls
    are retried with capped backoff).
-2. Go calls HA `media_player.volume_set` to the number entity's value **first**, then
-   `media_player.play_media` on the target with
+2. Go calls HA `media_player.volume_mute` (on), then `media_player.volume_set` to the
+   number entity's value, then `media_player.play_media` on the target with
    `media_content_id = x-rincon-mp3radio://<PUBLIC_BASE_URL>/stream?preset=<current>`,
-   `media_content_type = music` — so the Sonos never starts at its previous volume.
-3. The Sonos opens the stream; the HTTP handler starts a per-connection
-   noise → ffmpeg → MP3 pipeline and streams it indefinitely.
+   `media_content_type = music`. Volume goes before play so the Sonos never starts at its
+   previous volume. The mute hides a short blip the **Sonos itself** makes whenever it
+   starts an `x-rincon-mp3radio` stream (verified with a pure-silence file); Go unmutes
+   `HWN_UNMUTE_DELAY_MS` (default 300 ms) after HA reports `playing` (or after 15 s, or if the play fails or is
+   cancelled). At startup, a mute left on our stream by a crash mid-start is undone.
+3. The Sonos opens the stream (it makes a short throwaway connection first, then the one
+   it keeps); the HTTP handler starts a per-connection noise → ffmpeg → MP3 pipeline
+   and streams it indefinitely, up to 10 s ahead of real time, then paced.
 4. Watchdog: if the Sonos reports `idle`/`paused` on two consecutive polls, or recovers
    from `unavailable`, while the switch is ON, Go re-issues `play_media`. A 30 s suppress
    window follows every play so a Sonos that is still buffering isn't restarted.
@@ -90,6 +95,7 @@ cp .env.example .env
 | `HWN_DEFAULT_PRESET` | | `white` \| `pink` \| `brown`. Default `brown`. |
 | `HWN_DEFAULT_VOLUME` | | `0`–`100`. Default `80`. |
 | `HWN_FADE_IN_SECONDS` | | Fade-in length at stream start, `0`–`120` (`0` disables). Default `3`. |
+| `HWN_UNMUTE_DELAY_MS` | | How long the start-up mute is held after the Sonos reports `playing`, `0`–`5000` ms. Default `300`. Raise it if the Sonos's start-up blip is audible; lower it for a faster start. |
 | `HWN_LOG_LEVEL` | | `debug` \| `info` \| `warn` \| `error`. Default `info`. Structured (`log/slog`) to stderr. |
 
 The full list also lives in [`.env.example`](.env.example).

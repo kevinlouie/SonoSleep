@@ -23,6 +23,10 @@ type Config struct {
 	DefaultPreset string // HWN_DEFAULT_PRESET, one of white|pink|brown
 	DefaultVolume int    // HWN_DEFAULT_VOLUME, 0-100
 	FadeInSeconds int    // HWN_FADE_IN_SECONDS, 0-120 (0 disables), default 3
+	// UnmuteDelayMs is how long the start-up mute is held after the Sonos
+	// reports playing (HWN_UNMUTE_DELAY_MS, 0-5000, default 300). Raise it if the
+	// Sonos's start-up blip is audible; lower it for a faster start.
+	UnmuteDelayMs int
 	LogLevel      string // HWN_LOG_LEVEL, one of debug|info|warn|error (default info)
 }
 
@@ -44,6 +48,7 @@ func Load() (*Config, error) {
 		DefaultPreset: getEnv("HWN_DEFAULT_PRESET", "brown"),
 		DefaultVolume: 80,
 		FadeInSeconds: 3,
+		UnmuteDelayMs: 300,
 		LogLevel:      getEnv("HWN_LOG_LEVEL", "info"),
 	}
 
@@ -87,6 +92,18 @@ func Load() (*Config, error) {
 			problems = append(problems, fmt.Sprintf("HWN_FADE_IN_SECONDS %d must be 0-120", n))
 		default:
 			c.FadeInSeconds = n
+		}
+	}
+
+	if v := os.Getenv("HWN_UNMUTE_DELAY_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("HWN_UNMUTE_DELAY_MS %q must be an integer", v))
+		case n < 0 || n > 5000:
+			problems = append(problems, fmt.Sprintf("HWN_UNMUTE_DELAY_MS %d must be 0-5000", n))
+		default:
+			c.UnmuteDelayMs = n
 		}
 	}
 
